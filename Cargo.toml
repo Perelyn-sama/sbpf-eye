@@ -1,0 +1,8 @@
+[package]
+name = "sbpf-eye"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sbpf-common = "0.1.9"
+sbpf-disassembler = "0.1.9"

@@ -1,0 +1,10 @@
+.globl entrypoint
+
+entrypoint:
+  lddw r1, str_0000
+  mov64 r2, 0xe
+  call sol_log_
+  exit
+
+.rodata
+  str_0000: .ascii "Hello, Solana!"
