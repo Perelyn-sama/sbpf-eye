@@ -12260,11 +12260,3 @@ basic blocks by pc
     4248: 131,
     4296: 132,
 }
-
-
-for every block A
-    for every successor B of A
-        add A to B.predecessors
-
-
-check block A in the

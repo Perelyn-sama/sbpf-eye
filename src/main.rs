@@ -63,9 +63,9 @@ pub fn get_binary_info(path: &str) -> BinaryInfo {
         program.elf_header.e_flags == 0x02 && program.elf_header.e_machine == E_MACHINE_SBPF;
 
     let ixs_meta = extract_instructions(text_section, is_sbpf_v2);
-
-    let bbs = extract_basic_blocks(&ixs_meta);
-    let _reached = reach_bb(&bbs, 0);
+    let func_entries = extract_function_entries(&ixs_meta);
+    let bbs = extract_basic_blocks(&ixs_meta, &func_entries);
+    let _functions = extract_functions(&bbs, &func_entries);
 
     let ix_count = ixs_meta.len();
 
@@ -134,7 +134,10 @@ pub fn extract_instructions(text_section: Vec<u8>, is_sbpf_v2: bool) -> Vec<Inst
     ixs
 }
 
-pub fn extract_basic_blocks(ixs_meta: &Vec<InstructionMetadata>) -> Vec<BasicBlock> {
+pub fn extract_basic_blocks(
+    ixs_meta: &Vec<InstructionMetadata>,
+    func_entrypoints: &BTreeSet<usize>,
+) -> Vec<BasicBlock> {
     let last_ix = ixs_meta.last().unwrap();
     let text_end_pc = last_ix.pc + last_ix.len;
 
@@ -142,35 +145,6 @@ pub fn extract_basic_blocks(ixs_meta: &Vec<InstructionMetadata>) -> Vec<BasicBlo
         .iter()
         .map(|meta| (meta.pc, meta))
         .collect::<BTreeMap<_, _>>();
-
-    let calls = ixs_meta
-        .iter()
-        .filter(|meta| meta.ix.opcode == Opcode::Call && !meta.ix.is_syscall())
-        .collect::<Vec<&InstructionMetadata>>();
-
-    let instruction_starts = ixs_meta.iter().map(|meta| meta.pc).collect::<BTreeSet<_>>();
-
-    let mut incoming_call_counts = BTreeMap::<usize, usize>::new();
-
-    for call in calls {
-        let imm = match call.ix.imm.as_ref().unwrap().as_ref().right().unwrap() {
-            Number::Int(n) => *n,
-            _ => panic!("expected call imm int"),
-        };
-
-        let target_pc = call.pc as i64 + 8 + imm * 8;
-
-        if target_pc >= 0
-            && target_pc < text_end_pc as i64
-            && instruction_starts.contains(&(target_pc as usize))
-            && imm != -1
-        {
-            *incoming_call_counts.entry(target_pc as usize).or_default() += 1;
-        }
-    }
-
-    let mut func_entrypoints: Vec<&usize> = vec![&0];
-    func_entrypoints.append(&mut incoming_call_counts.keys().collect::<Vec<_>>());
 
     let mut leaders_pcs = BTreeSet::<usize>::new();
     leaders_pcs.insert(0);
@@ -301,7 +275,11 @@ pub fn extract_basic_blocks(ixs_meta: &Vec<InstructionMetadata>) -> Vec<BasicBlo
     bbs
 }
 
-pub fn reach_bb(bbs: &[BasicBlock], entry_id: usize) -> Vec<usize> {
+pub fn reach_bb(
+    bbs: &[BasicBlock],
+    entry_id: usize,
+    func_entries_bbs: Option<&BTreeSet<usize>>,
+) -> Vec<usize> {
     let mut reached = Vec::new();
     let mut visited = BTreeSet::new();
     let mut to_visit = vec![entry_id];
@@ -315,13 +293,93 @@ pub fn reach_bb(bbs: &[BasicBlock], entry_id: usize) -> Vec<usize> {
         reached.push(id);
 
         for successor in &bbs[id].successors {
-            if !visited.contains(successor) {
+            if !visited.contains(successor)
+                && !func_entries_bbs
+                    .as_ref()
+                    .is_some_and(|entries| entries.contains(successor))
+            {
                 to_visit.push(*successor);
             }
         }
     }
 
     reached
+}
+
+fn extract_function_entries(ixs_meta: &Vec<InstructionMetadata>) -> BTreeSet<usize> {
+    let last_ix = ixs_meta.last().unwrap();
+    let text_end_pc = last_ix.pc + last_ix.len;
+
+    let calls = ixs_meta
+        .iter()
+        .filter(|meta| meta.ix.opcode == Opcode::Call && !meta.ix.is_syscall())
+        .collect::<Vec<&InstructionMetadata>>();
+
+    let instruction_starts = ixs_meta.iter().map(|meta| meta.pc).collect::<BTreeSet<_>>();
+
+    // TODO: use count for call graph later
+    let mut incoming_call_counts = BTreeMap::<usize, usize>::new();
+
+    for call in calls {
+        let imm = match call.ix.imm.as_ref().unwrap().as_ref().right().unwrap() {
+            Number::Int(n) => *n,
+            _ => panic!("expected call imm int"),
+        };
+
+        let target_pc = call.pc as i64 + 8 + imm * 8;
+
+        if target_pc >= 0
+            && target_pc < text_end_pc as i64
+            && instruction_starts.contains(&(target_pc as usize))
+            && imm != -1
+        {
+            *incoming_call_counts.entry(target_pc as usize).or_default() += 1;
+        }
+    }
+
+    let mut func_entrypoints = BTreeSet::<usize>::new();
+    func_entrypoints.insert(0);
+    func_entrypoints.extend(incoming_call_counts.keys().copied());
+
+    func_entrypoints
+}
+
+fn extract_functions(bbs: &[BasicBlock], func_entries: &BTreeSet<usize>) -> Vec<Function> {
+    let mut funcs = Vec::new();
+
+    let bb_by_pc = bbs
+        .iter()
+        .map(|bbs| (bbs.start_pc, bbs))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut leader_bbs = Vec::new();
+
+    let func_entry_bbs = func_entries
+        .iter()
+        .map(|pc| bb_by_pc.get(pc).unwrap().id)
+        .collect::<BTreeSet<_>>();
+
+    for pc in func_entries {
+        let bb = bb_by_pc.get(pc).unwrap();
+        leader_bbs.push(bb);
+    }
+
+    let live_blocks = reach_bb(bbs, 0, None)
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    for (id, leader_bb) in leader_bbs.iter().enumerate() {
+        funcs.push(Function {
+            id,
+            entry_pc: leader_bb.start_pc as u64,
+            entry_block: leader_bb.id,
+            blocks: reach_bb(&bbs, leader_bb.id, Some(&func_entry_bbs)),
+            reachable_from_program_entry: live_blocks.contains(&leader_bb.id),
+        });
+    }
+
+    funcs
 }
 
 #[derive(Debug)]
@@ -364,4 +422,14 @@ impl Terminator {
             Terminator::Fallthrough { next } => vec![*next],
         }
     }
+}
+
+#[derive(Debug)]
+pub struct Function {
+    pub id: usize,
+    pub entry_pc: u64,
+    pub entry_block: usize,
+    pub blocks: Vec<usize>,
+    // NOTE: does not include calls
+    pub reachable_from_program_entry: bool,
 }
