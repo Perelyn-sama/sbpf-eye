@@ -65,7 +65,8 @@ pub fn get_binary_info(path: &str) -> BinaryInfo {
     let ixs_meta = extract_instructions(text_section, is_sbpf_v2);
     let func_entries = extract_function_entries(&ixs_meta);
     let bbs = extract_basic_blocks(&ixs_meta, &func_entries);
-    let _functions = extract_functions(&bbs, &func_entries);
+    let funcs = extract_functions(&bbs, &func_entries, &ixs_meta);
+    dbg!(funcs);
 
     let ix_count = ixs_meta.len();
 
@@ -86,13 +87,6 @@ pub fn get_binary_info(path: &str) -> BinaryInfo {
         text_section_size,
         max_stack_offset,
     }
-}
-
-#[derive(Debug)]
-pub struct InstructionMetadata {
-    pub pc: usize,
-    pub len: usize,
-    pub ix: Instruction,
 }
 
 pub fn extract_instructions(text_section: Vec<u8>, is_sbpf_v2: bool) -> Vec<InstructionMetadata> {
@@ -320,7 +314,7 @@ fn extract_function_entries(ixs_meta: &Vec<InstructionMetadata>) -> BTreeSet<usi
     // TODO: use count for call graph later
     let mut incoming_call_counts = BTreeMap::<usize, usize>::new();
 
-    for call in calls {
+    for call in &calls {
         let imm = match call.ix.imm.as_ref().unwrap().as_ref().right().unwrap() {
             Number::Int(n) => *n,
             _ => panic!("expected call imm int"),
@@ -344,7 +338,11 @@ fn extract_function_entries(ixs_meta: &Vec<InstructionMetadata>) -> BTreeSet<usi
     func_entrypoints
 }
 
-fn extract_functions(bbs: &[BasicBlock], func_entries: &BTreeSet<usize>) -> Vec<Function> {
+fn extract_functions(
+    bbs: &[BasicBlock],
+    func_entries: &BTreeSet<usize>,
+    ixs_meta: &Vec<InstructionMetadata>,
+) -> Vec<Function> {
     let mut funcs = Vec::new();
 
     let bb_by_pc = bbs
@@ -376,10 +374,88 @@ fn extract_functions(bbs: &[BasicBlock], func_entries: &BTreeSet<usize>) -> Vec<
             entry_block: leader_bb.id,
             blocks: reach_bb(&bbs, leader_bb.id, Some(&func_entry_bbs)),
             reachable_from_program_entry: live_blocks.contains(&leader_bb.id),
+            callees: BTreeSet::new(),
         });
     }
 
+    // turn pc to function id
+    let func_id_by_pc = funcs
+        .iter()
+        .map(|func| (func.entry_pc as usize, func.id))
+        .collect::<BTreeMap<usize, usize>>();
+
+    for i in 0..funcs.len() {
+        let callees = extract_function_callees(&funcs[i].blocks, bbs, func_entries, ixs_meta)
+            .iter()
+            .map(|pc| *func_id_by_pc.get(pc).unwrap())
+            .collect();
+
+        funcs[i].callees = callees;
+    }
+
     funcs
+}
+
+pub fn extract_function_callees(
+    blocks: &[usize],
+    bbs: &[BasicBlock],
+    func_entries: &BTreeSet<usize>,
+    ixs_meta: &Vec<InstructionMetadata>,
+) -> BTreeSet<usize> {
+    let bb_by_block_id = bbs.iter().map(|bb| (bb.id, bb)).collect::<BTreeMap<_, _>>();
+
+    let bbs = blocks
+        .iter()
+        .map(|bb_id| *bb_by_block_id.get(bb_id).unwrap())
+        .collect::<Vec<&BasicBlock>>();
+
+    // NOTE: improve name
+    let ixs_by_bb_id: BTreeMap<usize, Vec<&InstructionMetadata>> = bbs
+        .iter()
+        .map(|bb| {
+            let ixs_in_bb = ixs_meta
+                .iter()
+                .filter(|ix| ix.pc >= bb.start_pc && ix.pc < bb.end_pc_exclusive)
+                .collect::<Vec<_>>();
+            let id = bb.id;
+            (id, ixs_in_bb)
+        })
+        .collect();
+
+    let ixs_in_func = ixs_by_bb_id
+        .values()
+        .cloned()
+        .flatten()
+        .collect::<Vec<&InstructionMetadata>>();
+
+    let calls = ixs_in_func
+        .iter()
+        .copied()
+        .filter(|meta| meta.ix.opcode == Opcode::Call && !meta.ix.is_syscall())
+        .collect::<Vec<&InstructionMetadata>>();
+
+    let mut res = BTreeSet::new();
+
+    for call in &calls {
+        let imm = match call.ix.imm.as_ref().unwrap().as_ref().right().unwrap() {
+            Number::Int(n) => *n,
+            _ => panic!("expected call imm int"),
+        };
+
+        let target_pc = (call.pc as i64 + 8 + imm * 8) as usize;
+
+        if func_entries.contains(&target_pc) {
+            res.insert(target_pc);
+        }
+    }
+    res
+}
+
+#[derive(Debug)]
+pub struct InstructionMetadata {
+    pub pc: usize,
+    pub len: usize,
+    pub ix: Instruction,
 }
 
 #[derive(Debug)]
@@ -432,4 +508,5 @@ pub struct Function {
     pub blocks: Vec<usize>,
     // NOTE: does not include calls
     pub reachable_from_program_entry: bool,
+    pub callees: BTreeSet<usize>,
 }
