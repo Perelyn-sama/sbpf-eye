@@ -442,10 +442,12 @@ pub fn extract_function_callees(
             _ => panic!("expected call imm int"),
         };
 
-        let target_pc = (call.pc as i64 + 8 + imm * 8) as usize;
+        if imm != -1 {
+            let target_pc = (call.pc as i64 + 8 + imm * 8) as usize;
 
-        if func_entries.contains(&target_pc) {
-            res.insert(target_pc);
+            if func_entries.contains(&target_pc) {
+                res.insert(target_pc);
+            }
         }
     }
     res
