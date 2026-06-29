@@ -1,514 +1,408 @@
-use sbpf_common::inst_param::Number;
-use sbpf_common::{instruction::Instruction, opcode::Opcode};
-use sbpf_disassembler::elf_header::E_MACHINE_SBPF;
-use sbpf_disassembler::program::Program;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
-use std::{fs::File, io::Read};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+};
+use sbpf_eye::{BasicBlock, Function, InstructionMetadata, ProgramAnalysis, analyze_program};
+use std::{env, io};
 
-fn main() {
-    // dbg!(get_binary_info("samples/hello_solana_native_program.so"));
-    dbg!(get_binary_info("samples/hello_solana_pinocchio_program.so"));
-    // dbg!(get_binary_info("samples/hello_solana_asm_program.so"));
+const DEFAULT_PROGRAM: &str = "samples/hello_solana_pinocchio_program.so";
+
+fn main() -> io::Result<()> {
+    let path = env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_PROGRAM.to_string());
+    let analysis = analyze_program(&path);
+    run_tui(path, analysis)
 }
 
-pub fn is_stack_access(ins: &Instruction) -> bool {
-    let is_mem = matches!(
-        ins.opcode,
-        Opcode::Stb
-            | Opcode::Sth
-            | Opcode::Stw
-            | Opcode::Stdw
-            | Opcode::Stxb
-            | Opcode::Stxh
-            | Opcode::Stxw
-            | Opcode::Stxdw
-            | Opcode::Ldxb
-            | Opcode::Ldxh
-            | Opcode::Ldxw
-            | Opcode::Ldxdw
-    );
+fn run_tui(path: String, analysis: ProgramAnalysis) -> io::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
-    let is_r10 = ins.dst.as_ref().map(|r| r.n == 10).unwrap_or(false)
-        || ins.src.as_ref().map(|r| r.n == 10).unwrap_or(false);
+    let mut app = App::new(path, analysis);
+    let result = app.run(&mut terminal);
 
-    is_mem && is_r10
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct BinaryInfo {
-    pub size: usize,
-    pub ix_count: usize,
-    pub text_section_size: usize,
-    pub max_stack_offset: usize,
+enum ActivePane {
+    Functions,
+    Blocks,
+    Instructions,
 }
 
-pub fn get_binary_info(path: &str) -> BinaryInfo {
-    let mut file = File::open(path).unwrap();
-    let mut b = vec![];
-    file.read_to_end(&mut b).unwrap();
-    let program = Program::from_bytes(&b).unwrap();
-    let text_section = program
-        .section_header_entries
-        .iter()
-        .filter(|sect| sect.label == ".text\0")
-        .collect::<Vec<_>>()[0]
-        .data
-        .clone();
-
-    let size = b.len();
-    let text_section_size = text_section.len();
-
-    let is_sbpf_v2 =
-        program.elf_header.e_flags == 0x02 && program.elf_header.e_machine == E_MACHINE_SBPF;
-
-    let ixs_meta = extract_instructions(text_section, is_sbpf_v2);
-    let func_entries = extract_function_entries(&ixs_meta);
-    let bbs = extract_basic_blocks(&ixs_meta, &func_entries);
-    let funcs = extract_functions(&bbs, &func_entries, &ixs_meta);
-    dbg!(funcs);
-
-    let ix_count = ixs_meta.len();
-
-    let ixs = program.to_ixs().unwrap().0;
-    let max_stack_offset = ixs
-        .iter()
-        .filter(|ix| is_stack_access(ix))
-        .filter_map(|ix| ix.off.clone())
-        .filter_map(|off| off.right())
-        .filter(|off| *off < 0)
-        .map(|off| (-off) as usize)
-        .max()
-        .unwrap_or(0);
-
-    BinaryInfo {
-        size,
-        ix_count,
-        text_section_size,
-        max_stack_offset,
-    }
+struct App {
+    path: String,
+    analysis: ProgramAnalysis,
+    active_pane: ActivePane,
+    function_state: ListState,
+    block_state: ListState,
+    instruction_state: ListState,
 }
 
-pub fn extract_instructions(text_section: Vec<u8>, is_sbpf_v2: bool) -> Vec<InstructionMetadata> {
-    let mut pc = 0;
-    let mut ixs: Vec<InstructionMetadata> = Vec::new();
+impl App {
+    fn new(path: String, analysis: ProgramAnalysis) -> Self {
+        let mut function_state = ListState::default();
+        function_state.select((!analysis.functions.is_empty()).then_some(0));
 
-    while pc < text_section.len() {
-        let remaining = text_section.len() - pc;
+        let mut block_state = ListState::default();
+        block_state.select(
+            analysis
+                .functions
+                .first()
+                .is_some_and(|func| !func.blocks.is_empty())
+                .then_some(0),
+        );
 
-        let window_len = if remaining >= 16 {
-            16
-        } else if remaining >= 8 {
-            8
-        } else {
-            break;
-        };
+        let mut instruction_state = ListState::default();
+        instruction_state.select(Some(0));
 
-        let window = &text_section[pc..pc + window_len];
-
-        let ix = if is_sbpf_v2 {
-            Instruction::from_bytes_sbpf_v2(window).unwrap()
-        } else {
-            Instruction::from_bytes(window).unwrap()
-        };
-
-        let ix_span_len = ix.span.len();
-
-        let ix_metadata = InstructionMetadata {
-            pc: pc,
-            len: ix_span_len,
-            ix: ix,
-        };
-
-        pc += ix_span_len;
-
-        ixs.push(ix_metadata);
+        Self {
+            path,
+            analysis,
+            active_pane: ActivePane::Functions,
+            function_state,
+            block_state,
+            instruction_state,
+        }
     }
 
-    ixs
-}
+    fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+        loop {
+            terminal.draw(|frame| self.render(frame))?;
 
-pub fn extract_basic_blocks(
-    ixs_meta: &Vec<InstructionMetadata>,
-    func_entrypoints: &BTreeSet<usize>,
-) -> Vec<BasicBlock> {
-    let last_ix = ixs_meta.last().unwrap();
-    let text_end_pc = last_ix.pc + last_ix.len;
-
-    let ix_by_pc = ixs_meta
-        .iter()
-        .map(|meta| (meta.pc, meta))
-        .collect::<BTreeMap<_, _>>();
-
-    let mut leaders_pcs = BTreeSet::<usize>::new();
-    leaders_pcs.insert(0);
-    for pc in func_entrypoints {
-        leaders_pcs.insert(*pc);
-    }
-
-    let mut bbs: Vec<BasicBlock> = Vec::new();
-    for meta in ixs_meta {
-        if meta.ix.is_jump() {
-            let current_slot = meta.pc as isize / 8;
-            let off = &meta.ix.off.as_ref().unwrap().clone().unwrap_right();
-            let target_slot = current_slot + 1 + *off as isize;
-
-            if target_slot >= 0 {
-                let target_pc = (target_slot * 8) as usize;
-                if ix_by_pc.contains_key(&target_pc) {
-                    leaders_pcs.insert(target_pc);
+            if let Event::Key(key) = event::read()? {
+                if self.handle_key(key) {
+                    break;
                 }
             }
+        }
 
-            let ix_after_jump_pc = meta.pc + meta.len;
-            if ix_by_pc.contains_key(&ix_after_jump_pc) {
-                leaders_pcs.insert(ix_after_jump_pc);
+        Ok(())
+    }
+
+    fn render(&mut self, frame: &mut ratatui::Frame) {
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(9),
+            ])
+            .split(frame.area());
+
+        let info = self.info_line();
+        frame.render_widget(
+            Paragraph::new(info).block(Block::default().borders(Borders::ALL).title("Program")),
+            outer[0],
+        );
+
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(28),
+                Constraint::Percentage(27),
+                Constraint::Percentage(45),
+            ])
+            .split(outer[1]);
+
+        let function_items = self.function_items();
+        let mut function_state = self.function_state.clone();
+        frame.render_stateful_widget(
+            self.list("Functions", ActivePane::Functions, function_items),
+            columns[0],
+            &mut function_state,
+        );
+        self.function_state = function_state;
+
+        let block_items = self.block_items();
+        let mut block_state = self.block_state.clone();
+        frame.render_stateful_widget(
+            self.list("Blocks", ActivePane::Blocks, block_items),
+            columns[1],
+            &mut block_state,
+        );
+        self.block_state = block_state;
+
+        let instruction_items = self.instruction_items();
+        let mut instruction_state = self.instruction_state.clone();
+        frame.render_stateful_widget(
+            self.list("Instructions", ActivePane::Instructions, instruction_items),
+            columns[2],
+            &mut instruction_state,
+        );
+        self.instruction_state = instruction_state;
+
+        let detail = Paragraph::new(self.selected_detail_text())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(self.selected_detail_title()),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(detail, outer[2]);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Tab => self.next_pane(),
+            KeyCode::BackTab => self.previous_pane(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+            _ => {}
+        }
+
+        false
+    }
+
+    fn next_pane(&mut self) {
+        self.active_pane = match self.active_pane {
+            ActivePane::Functions => ActivePane::Blocks,
+            ActivePane::Blocks => ActivePane::Instructions,
+            ActivePane::Instructions => ActivePane::Functions,
+        };
+    }
+
+    fn previous_pane(&mut self) {
+        self.active_pane = match self.active_pane {
+            ActivePane::Functions => ActivePane::Instructions,
+            ActivePane::Blocks => ActivePane::Functions,
+            ActivePane::Instructions => ActivePane::Blocks,
+        };
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        match self.active_pane {
+            ActivePane::Functions => {
+                move_list_selection(
+                    &mut self.function_state,
+                    self.analysis.functions.len(),
+                    delta,
+                );
+                self.block_state
+                    .select((!self.selected_function_blocks().is_empty()).then_some(0));
+                self.instruction_state
+                    .select((!self.selected_block_instructions().is_empty()).then_some(0));
+            }
+            ActivePane::Blocks => {
+                let block_count = self.selected_function_blocks().len();
+                move_list_selection(&mut self.block_state, block_count, delta);
+                self.instruction_state
+                    .select((!self.selected_block_instructions().is_empty()).then_some(0));
+            }
+            ActivePane::Instructions => {
+                let instruction_count = self.selected_block_instructions().len();
+                move_list_selection(&mut self.instruction_state, instruction_count, delta);
             }
         }
     }
 
-    let jump_target_pc = |ix: &InstructionMetadata| -> Option<usize> {
-        let current_slot = ix.pc as isize / 8;
-        let off = *ix.ix.off.as_ref().unwrap().as_ref().right().unwrap();
-        let target_slot = current_slot + 1 + off as isize;
+    fn info_line(&self) -> Line<'static> {
+        let info = self.analysis.binary_info;
+        Line::from(vec![
+            Span::styled(self.path.clone(), Style::default().fg(Color::Cyan)),
+            Span::raw(format!(
+                "  size={} text={} instructions={} max_stack={}",
+                info.size, info.text_section_size, info.ix_count, info.max_stack_offset
+            )),
+        ])
+    }
 
-        if target_slot < 0 {
-            return None;
-        }
+    fn list<'a>(&self, title: &'a str, pane: ActivePane, items: Vec<ListItem<'a>>) -> List<'a> {
+        let style = if std::mem::discriminant(&self.active_pane) == std::mem::discriminant(&pane) {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
 
-        let target_pc = target_slot as usize * 8;
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(title, style)),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("> ")
+    }
 
-        ix_by_pc.contains_key(&target_pc).then_some(target_pc)
-    };
-
-    let leaders: Vec<usize> = leaders_pcs.into_iter().collect();
-    let bb_by_pc = leaders
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(id, pc)| (pc, id))
-        .collect::<BTreeMap<_, _>>();
-
-    for i in 0..leaders.len() {
-        let start = leaders[i];
-
-        let end = leaders.get(i + 1).copied().unwrap_or(text_end_pc);
-
-        let last = ixs_meta
+    fn function_items(&self) -> Vec<ListItem<'static>> {
+        self.analysis
+            .functions
             .iter()
-            .take_while(|meta| meta.pc < end)
-            .last()
-            .unwrap();
+            .map(|func| ListItem::new(function_line(func)))
+            .collect()
+    }
 
-        let terminator = match last.ix.opcode {
-            Opcode::Exit => Terminator::Exit,
-            Opcode::Ja => {
-                let target = jump_target_pc(last).unwrap();
-                Terminator::Jump { target }
-            }
-
-            _ if last.ix.is_jump() => {
-                let target = jump_target_pc(last).unwrap();
-                let fallthrough = last.pc + last.len;
-
-                if !ix_by_pc.contains_key(&fallthrough) {
-                    panic!("conditional jump has invalid fallthrough as pc {}", last.pc);
-                }
-
-                Terminator::Branch {
-                    target,
-                    fallthrough,
-                }
-            }
-            _ => {
-                let next = last.pc + last.len;
-                if ix_by_pc.contains_key(&next) {
-                    Terminator::Fallthrough { next }
-                } else if next == text_end_pc {
-                    Terminator::Unreachable
-                } else {
-                    panic!(
-                        "non-terminal block has invalid fallthrough at pc {}",
-                        last.pc
-                    );
-                }
-            }
-        };
-
-        let successors = terminator
-            .successor_pcs()
+    fn block_items(&self) -> Vec<ListItem<'static>> {
+        self.selected_function_blocks()
             .into_iter()
-            .map(|pc| *bb_by_pc.get(&pc).unwrap())
-            .collect::<Vec<_>>();
-
-        bbs.push(BasicBlock {
-            id: i,
-            start_pc: start,
-            end_pc_exclusive: end,
-            terminator: terminator,
-            successors,
-            predecessors: BTreeSet::new(),
-        })
+            .filter_map(|block_id| self.analysis.blocks.get(block_id))
+            .map(|block| ListItem::new(block_line(block)))
+            .collect()
     }
 
-    //  if i is in bb.successors insert id in predecessors
-    for i in 0..bbs.len() {
-        let mut predecessors = BTreeSet::new();
-
-        for (id, bb) in bbs.iter().enumerate() {
-            for successor in &bb.successors {
-                if *successor == i {
-                    predecessors.insert(id);
-                }
-            }
-        }
-
-        bbs[i].predecessors = predecessors;
+    fn instruction_items(&self) -> Vec<ListItem<'static>> {
+        self.selected_block_instructions()
+            .into_iter()
+            .map(|ix| ListItem::new(instruction_line(ix)))
+            .collect()
     }
 
-    bbs
-}
-
-pub fn reach_bb(
-    bbs: &[BasicBlock],
-    entry_id: usize,
-    func_entries_bbs: Option<&BTreeSet<usize>>,
-) -> Vec<usize> {
-    let mut reached = Vec::new();
-    let mut visited = BTreeSet::new();
-    let mut to_visit = vec![entry_id];
-
-    while let Some(id) = to_visit.pop() {
-        if visited.contains(&id) {
-            continue;
-        }
-
-        visited.insert(id);
-        reached.push(id);
-
-        for successor in &bbs[id].successors {
-            if !visited.contains(successor)
-                && !func_entries_bbs
-                    .as_ref()
-                    .is_some_and(|entries| entries.contains(successor))
-            {
-                to_visit.push(*successor);
-            }
-        }
+    fn selected_function(&self) -> Option<&Function> {
+        self.function_state
+            .selected()
+            .and_then(|idx| self.analysis.functions.get(idx))
     }
 
-    reached
-}
+    fn selected_function_blocks(&self) -> Vec<usize> {
+        self.selected_function()
+            .map(|func| func.blocks.clone())
+            .unwrap_or_default()
+    }
 
-fn extract_function_entries(ixs_meta: &Vec<InstructionMetadata>) -> BTreeSet<usize> {
-    let last_ix = ixs_meta.last().unwrap();
-    let text_end_pc = last_ix.pc + last_ix.len;
+    fn selected_block(&self) -> Option<&BasicBlock> {
+        let blocks = self.selected_function_blocks();
+        self.block_state
+            .selected()
+            .and_then(|idx| blocks.get(idx))
+            .and_then(|block_id| self.analysis.blocks.get(*block_id))
+    }
 
-    let calls = ixs_meta
-        .iter()
-        .filter(|meta| meta.ix.opcode == Opcode::Call && !meta.ix.is_syscall())
-        .collect::<Vec<&InstructionMetadata>>();
+    fn selected_block_instructions(&self) -> Vec<&InstructionMetadata> {
+        self.selected_block()
+            .map(|block| {
+                self.analysis
+                    .instructions
+                    .iter()
+                    .filter(|ix| ix.pc >= block.start_pc && ix.pc < block.end_pc_exclusive)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
-    let instruction_starts = ixs_meta.iter().map(|meta| meta.pc).collect::<BTreeSet<_>>();
+    fn selected_instruction(&self) -> Option<&InstructionMetadata> {
+        let instructions = self.selected_block_instructions();
+        self.instruction_state
+            .selected()
+            .and_then(|idx| instructions.get(idx).copied())
+    }
 
-    // TODO: use count for call graph later
-    let mut incoming_call_counts = BTreeMap::<usize, usize>::new();
-
-    for call in &calls {
-        let imm = match call.ix.imm.as_ref().unwrap().as_ref().right().unwrap() {
-            Number::Int(n) => *n,
-            _ => panic!("expected call imm int"),
-        };
-
-        let target_pc = call.pc as i64 + 8 + imm * 8;
-
-        if target_pc >= 0
-            && target_pc < text_end_pc as i64
-            && instruction_starts.contains(&(target_pc as usize))
-            && imm != -1
-        {
-            *incoming_call_counts.entry(target_pc as usize).or_default() += 1;
+    fn selected_detail_title(&self) -> &'static str {
+        match self.active_pane {
+            ActivePane::Functions => "Function Details",
+            ActivePane::Blocks => "Block Details",
+            ActivePane::Instructions => "Instruction Details",
         }
     }
 
-    let mut func_entrypoints = BTreeSet::<usize>::new();
-    func_entrypoints.insert(0);
-    func_entrypoints.extend(incoming_call_counts.keys().copied());
-
-    func_entrypoints
-}
-
-fn extract_functions(
-    bbs: &[BasicBlock],
-    func_entries: &BTreeSet<usize>,
-    ixs_meta: &Vec<InstructionMetadata>,
-) -> Vec<Function> {
-    let mut funcs = Vec::new();
-
-    let bb_by_pc = bbs
-        .iter()
-        .map(|bbs| (bbs.start_pc, bbs))
-        .collect::<BTreeMap<_, _>>();
-
-    let mut leader_bbs = Vec::new();
-
-    let func_entry_bbs = func_entries
-        .iter()
-        .map(|pc| bb_by_pc.get(pc).unwrap().id)
-        .collect::<BTreeSet<_>>();
-
-    for pc in func_entries {
-        let bb = bb_by_pc.get(pc).unwrap();
-        leader_bbs.push(bb);
-    }
-
-    let live_blocks = reach_bb(bbs, 0, None)
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-
-    for (id, leader_bb) in leader_bbs.iter().enumerate() {
-        funcs.push(Function {
-            id,
-            entry_pc: leader_bb.start_pc as u64,
-            entry_block: leader_bb.id,
-            blocks: reach_bb(&bbs, leader_bb.id, Some(&func_entry_bbs)),
-            reachable_from_program_entry: live_blocks.contains(&leader_bb.id),
-            callees: BTreeSet::new(),
-        });
-    }
-
-    // turn pc to function id
-    let func_id_by_pc = funcs
-        .iter()
-        .map(|func| (func.entry_pc as usize, func.id))
-        .collect::<BTreeMap<usize, usize>>();
-
-    for i in 0..funcs.len() {
-        let callees = extract_function_callees(&funcs[i].blocks, bbs, func_entries, ixs_meta)
-            .iter()
-            .map(|pc| *func_id_by_pc.get(pc).unwrap())
-            .collect();
-
-        funcs[i].callees = callees;
-    }
-
-    funcs
-}
-
-pub fn extract_function_callees(
-    blocks: &[usize],
-    bbs: &[BasicBlock],
-    func_entries: &BTreeSet<usize>,
-    ixs_meta: &Vec<InstructionMetadata>,
-) -> BTreeSet<usize> {
-    let bb_by_block_id = bbs.iter().map(|bb| (bb.id, bb)).collect::<BTreeMap<_, _>>();
-
-    let bbs = blocks
-        .iter()
-        .map(|bb_id| *bb_by_block_id.get(bb_id).unwrap())
-        .collect::<Vec<&BasicBlock>>();
-
-    // NOTE: improve name
-    let ixs_by_bb_id: BTreeMap<usize, Vec<&InstructionMetadata>> = bbs
-        .iter()
-        .map(|bb| {
-            let ixs_in_bb = ixs_meta
-                .iter()
-                .filter(|ix| ix.pc >= bb.start_pc && ix.pc < bb.end_pc_exclusive)
-                .collect::<Vec<_>>();
-            let id = bb.id;
-            (id, ixs_in_bb)
-        })
-        .collect();
-
-    let ixs_in_func = ixs_by_bb_id
-        .values()
-        .cloned()
-        .flatten()
-        .collect::<Vec<&InstructionMetadata>>();
-
-    let calls = ixs_in_func
-        .iter()
-        .copied()
-        .filter(|meta| meta.ix.opcode == Opcode::Call && !meta.ix.is_syscall())
-        .collect::<Vec<&InstructionMetadata>>();
-
-    let mut res = BTreeSet::new();
-
-    for call in &calls {
-        let imm = match call.ix.imm.as_ref().unwrap().as_ref().right().unwrap() {
-            Number::Int(n) => *n,
-            _ => panic!("expected call imm int"),
-        };
-
-        if imm != -1 {
-            let target_pc = (call.pc as i64 + 8 + imm * 8) as usize;
-
-            if func_entries.contains(&target_pc) {
-                res.insert(target_pc);
-            }
-        }
-    }
-    res
-}
-
-#[derive(Debug)]
-pub struct InstructionMetadata {
-    pub pc: usize,
-    pub len: usize,
-    pub ix: Instruction,
-}
-
-#[derive(Debug)]
-pub struct BasicBlock {
-    pub id: usize,
-    pub start_pc: usize,
-    pub end_pc_exclusive: usize,
-    pub terminator: Terminator,
-    pub successors: Vec<usize>,
-    pub predecessors: BTreeSet<usize>,
-}
-
-#[derive(Debug)]
-pub enum Terminator {
-    Exit,
-    Jump { target: usize },
-    Branch { target: usize, fallthrough: usize },
-    Fallthrough { next: usize },
-    Unreachable,
-}
-
-impl Terminator {
-    pub fn successor_pcs(&self) -> Vec<usize> {
-        match self {
-            Terminator::Exit | Terminator::Unreachable => vec![],
-
-            Terminator::Jump { target } => vec![*target],
-
-            Terminator::Branch {
-                target,
-                fallthrough,
-            } => {
-                if target == fallthrough {
-                    vec![*target]
-                } else {
-                    vec![*target, *fallthrough]
-                }
-            }
-
-            Terminator::Fallthrough { next } => vec![*next],
+    fn selected_detail_text(&self) -> String {
+        match self.active_pane {
+            ActivePane::Functions => self
+                .selected_function()
+                .map(function_detail)
+                .unwrap_or_else(|| "No function selected".to_string()),
+            ActivePane::Blocks => self
+                .selected_block()
+                .map(block_detail)
+                .unwrap_or_else(|| "No block selected".to_string()),
+            ActivePane::Instructions => self
+                .selected_instruction()
+                .map(instruction_detail)
+                .unwrap_or_else(|| "No instruction selected".to_string()),
         }
     }
 }
 
-#[derive(Debug)]
-pub struct Function {
-    pub id: usize,
-    pub entry_pc: u64,
-    pub entry_block: usize,
-    pub blocks: Vec<usize>,
-    // NOTE: does not include calls
-    pub reachable_from_program_entry: bool,
-    pub callees: BTreeSet<usize>,
+fn move_list_selection(state: &mut ListState, len: usize, delta: isize) {
+    if len == 0 {
+        state.select(None);
+        return;
+    }
+
+    let selected = state.selected().unwrap_or(0) as isize;
+    let max = len.saturating_sub(1) as isize;
+    let next = (selected + delta).clamp(0, max) as usize;
+    state.select(Some(next));
+}
+
+fn function_line(func: &Function) -> Line<'static> {
+    Line::from(format!(
+        "#{:<3} pc={:<5} blocks={:<3} live={} calls={:?}",
+        func.id,
+        func.entry_pc,
+        func.blocks.len(),
+        func.reachable_from_program_entry,
+        func.callees
+    ))
+}
+
+fn block_line(block: &BasicBlock) -> Line<'static> {
+    Line::from(format!(
+        "#{:<3} {}..{} succ={:?} pred={:?}",
+        block.id, block.start_pc, block.end_pc_exclusive, block.successors, block.predecessors
+    ))
+}
+
+fn instruction_line(ix: &InstructionMetadata) -> Line<'static> {
+    Line::from(format!(
+        "{:<5} {:?} imm={:?}",
+        ix.pc, ix.ix.opcode, ix.ix.imm
+    ))
+}
+
+fn function_detail(func: &Function) -> String {
+    format!(
+        "id: {}\nentry_pc: {}\nentry_block: {}\nreachable_from_program_entry: {}\nblocks: {:?}\ncallees: {:?}",
+        func.id,
+        func.entry_pc,
+        func.entry_block,
+        func.reachable_from_program_entry,
+        func.blocks,
+        func.callees
+    )
+}
+
+fn block_detail(block: &BasicBlock) -> String {
+    format!(
+        "id: {}\npc_range: {}..{}\nterminator: {:?}\nsuccessors: {:?}\npredecessors: {:?}",
+        block.id,
+        block.start_pc,
+        block.end_pc_exclusive,
+        block.terminator,
+        block.successors,
+        block.predecessors
+    )
+}
+
+fn instruction_detail(ix: &InstructionMetadata) -> String {
+    format!(
+        "pc: {}\nlen: {}\nopcode: {:?}\ndst: {:?}\nsrc: {:?}\noff: {:?}\nimm: {:?}\ninstruction: {:#?}",
+        ix.pc, ix.len, ix.ix.opcode, ix.ix.dst, ix.ix.src, ix.ix.off, ix.ix.imm, ix.ix
+    )
 }
