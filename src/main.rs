@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -16,12 +17,17 @@ use std::{env, io};
 
 const DEFAULT_PROGRAM: &str = "samples/hello_solana_pinocchio_program.so";
 
-fn main() -> io::Result<()> {
+fn main() -> Result<()> {
     let path = env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_PROGRAM.to_string());
-    let analysis = analyze_program(&path);
-    run_tui(path, analysis)
+
+    let analysis =
+        analyze_program(&path).with_context(|| format!("failed to analyze program at {path}"))?;
+
+    run_tui(path, analysis)?;
+
+    Ok(())
 }
 
 fn run_tui(path: String, analysis: ProgramAnalysis) -> io::Result<()> {
@@ -60,14 +66,14 @@ struct App {
 impl App {
     fn new(path: String, analysis: ProgramAnalysis) -> Self {
         let mut function_state = ListState::default();
-        function_state.select((!analysis.functions.is_empty()).then_some(0));
+        function_state.select((!analysis.functions().is_empty()).then_some(0));
 
         let mut block_state = ListState::default();
         block_state.select(
             analysis
-                .functions
+                .functions()
                 .first()
-                .is_some_and(|func| !func.blocks.is_empty())
+                .is_some_and(|func| !func.blocks().is_empty())
                 .then_some(0),
         );
 
@@ -195,7 +201,7 @@ impl App {
             ActivePane::Functions => {
                 move_list_selection(
                     &mut self.function_state,
-                    self.analysis.functions.len(),
+                    self.analysis.functions().len(),
                     delta,
                 );
                 self.block_state
@@ -217,12 +223,15 @@ impl App {
     }
 
     fn info_line(&self) -> Line<'static> {
-        let info = self.analysis.binary_info;
+        let info = self.analysis.binary_info();
         Line::from(vec![
             Span::styled(self.path.clone(), Style::default().fg(Color::Cyan)),
             Span::raw(format!(
                 "  size={} text={} instructions={} max_stack={}",
-                info.size, info.text_section_size, info.ix_count, info.max_stack_offset
+                info.size(),
+                info.text_section_size(),
+                info.ix_count(),
+                info.max_stack_offset()
             )),
         ])
     }
@@ -253,7 +262,7 @@ impl App {
 
     fn function_items(&self) -> Vec<ListItem<'static>> {
         self.analysis
-            .functions
+            .functions()
             .iter()
             .map(|func| ListItem::new(function_line(func)))
             .collect()
@@ -262,7 +271,7 @@ impl App {
     fn block_items(&self) -> Vec<ListItem<'static>> {
         self.selected_function_blocks()
             .into_iter()
-            .filter_map(|block_id| self.analysis.blocks.get(block_id))
+            .filter_map(|block_id| self.analysis.blocks().get(block_id))
             .map(|block| ListItem::new(block_line(block)))
             .collect()
     }
@@ -277,12 +286,12 @@ impl App {
     fn selected_function(&self) -> Option<&Function> {
         self.function_state
             .selected()
-            .and_then(|idx| self.analysis.functions.get(idx))
+            .and_then(|idx| self.analysis.functions().get(idx))
     }
 
     fn selected_function_blocks(&self) -> Vec<usize> {
         self.selected_function()
-            .map(|func| func.blocks.clone())
+            .map(|func| func.blocks().to_vec())
             .unwrap_or_default()
     }
 
@@ -291,16 +300,16 @@ impl App {
         self.block_state
             .selected()
             .and_then(|idx| blocks.get(idx))
-            .and_then(|block_id| self.analysis.blocks.get(*block_id))
+            .and_then(|block_id| self.analysis.blocks().get(*block_id))
     }
 
     fn selected_block_instructions(&self) -> Vec<&InstructionMetadata> {
         self.selected_block()
             .map(|block| {
                 self.analysis
-                    .instructions
+                    .instructions()
                     .iter()
-                    .filter(|ix| ix.pc >= block.start_pc && ix.pc < block.end_pc_exclusive)
+                    .filter(|ix| ix.pc() >= block.start_pc() && ix.pc() < block.end_pc_exclusive())
                     .collect()
             })
             .unwrap_or_default()
@@ -354,55 +363,68 @@ fn move_list_selection(state: &mut ListState, len: usize, delta: isize) {
 fn function_line(func: &Function) -> Line<'static> {
     Line::from(format!(
         "#{:<3} pc={:<5} blocks={:<3} live={} calls={:?}",
-        func.id,
-        func.entry_pc,
-        func.blocks.len(),
-        func.reachable_from_program_entry,
-        func.callees
+        func.id(),
+        func.entry_pc(),
+        func.blocks().len(),
+        func.reachable_from_program_entry(),
+        func.callees()
     ))
 }
 
 fn block_line(block: &BasicBlock) -> Line<'static> {
     Line::from(format!(
         "#{:<3} {}..{} succ={:?} pred={:?}",
-        block.id, block.start_pc, block.end_pc_exclusive, block.successors, block.predecessors
+        block.id(),
+        block.start_pc(),
+        block.end_pc_exclusive(),
+        block.successors(),
+        block.predecessors()
     ))
 }
 
 fn instruction_line(ix: &InstructionMetadata) -> Line<'static> {
     Line::from(format!(
         "{:<5} {:?} imm={:?}",
-        ix.pc, ix.ix.opcode, ix.ix.imm
+        ix.pc(),
+        ix.instruction().opcode,
+        ix.instruction().imm
     ))
 }
 
 fn function_detail(func: &Function) -> String {
     format!(
         "id: {}\nentry_pc: {}\nentry_block: {}\nreachable_from_program_entry: {}\nblocks: {:?}\ncallees: {:?}",
-        func.id,
-        func.entry_pc,
-        func.entry_block,
-        func.reachable_from_program_entry,
-        func.blocks,
-        func.callees
+        func.id(),
+        func.entry_pc(),
+        func.entry_block(),
+        func.reachable_from_program_entry(),
+        func.blocks(),
+        func.callees()
     )
 }
 
 fn block_detail(block: &BasicBlock) -> String {
     format!(
         "id: {}\npc_range: {}..{}\nterminator: {:?}\nsuccessors: {:?}\npredecessors: {:?}",
-        block.id,
-        block.start_pc,
-        block.end_pc_exclusive,
-        block.terminator,
-        block.successors,
-        block.predecessors
+        block.id(),
+        block.start_pc(),
+        block.end_pc_exclusive(),
+        block.terminator(),
+        block.successors(),
+        block.predecessors()
     )
 }
 
 fn instruction_detail(ix: &InstructionMetadata) -> String {
     format!(
         "pc: {}\nlen: {}\nopcode: {:?}\ndst: {:?}\nsrc: {:?}\noff: {:?}\nimm: {:?}\ninstruction: {:#?}",
-        ix.pc, ix.len, ix.ix.opcode, ix.ix.dst, ix.ix.src, ix.ix.off, ix.ix.imm, ix.ix
+        ix.pc(),
+        ix.len(),
+        ix.instruction().opcode,
+        ix.instruction().dst,
+        ix.instruction().src,
+        ix.instruction().off,
+        ix.instruction().imm,
+        ix.instruction()
     )
 }

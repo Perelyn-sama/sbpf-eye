@@ -5,8 +5,268 @@ use sbpf_disassembler::program::Program;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::{fs::File, io::Read};
+use thiserror::Error;
 
-pub fn is_stack_access(ins: &Instruction) -> bool {
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryInfo {
+    size: usize,
+    ix_count: usize,
+    text_section_size: usize,
+    max_stack_offset: usize,
+}
+
+impl BinaryInfo {
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn ix_count(&self) -> usize {
+        self.ix_count
+    }
+
+    pub fn text_section_size(&self) -> usize {
+        self.text_section_size
+    }
+
+    pub fn max_stack_offset(&self) -> usize {
+        self.max_stack_offset
+    }
+}
+
+#[derive(Debug)]
+pub struct ProgramAnalysis {
+    binary_info: BinaryInfo,
+    instructions: Vec<InstructionMetadata>,
+    blocks: Vec<BasicBlock>,
+    functions: Vec<Function>,
+}
+
+impl ProgramAnalysis {
+    pub fn binary_info(&self) -> BinaryInfo {
+        self.binary_info
+    }
+
+    pub fn instructions(&self) -> &[InstructionMetadata] {
+        &self.instructions
+    }
+
+    pub fn blocks(&self) -> &[BasicBlock] {
+        &self.blocks
+    }
+
+    pub fn functions(&self) -> &[Function] {
+        &self.functions
+    }
+}
+
+#[derive(Debug)]
+pub struct InstructionMetadata {
+    pc: usize,
+    len: usize,
+    ix: Instruction,
+}
+
+impl InstructionMetadata {
+    pub fn pc(&self) -> usize {
+        self.pc
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn instruction(&self) -> &Instruction {
+        &self.ix
+    }
+}
+
+#[derive(Debug)]
+pub struct BasicBlock {
+    id: usize,
+    start_pc: usize,
+    end_pc_exclusive: usize,
+    terminator: Terminator,
+    successors: Vec<usize>,
+    predecessors: BTreeSet<usize>,
+}
+
+impl BasicBlock {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn start_pc(&self) -> usize {
+        self.start_pc
+    }
+
+    pub fn end_pc_exclusive(&self) -> usize {
+        self.end_pc_exclusive
+    }
+
+    pub fn terminator(&self) -> &Terminator {
+        &self.terminator
+    }
+
+    pub fn successors(&self) -> &[usize] {
+        &self.successors
+    }
+
+    pub fn predecessors(&self) -> &BTreeSet<usize> {
+        &self.predecessors
+    }
+}
+
+#[derive(Debug)]
+pub enum Terminator {
+    Exit,
+    Jump { target: usize },
+    Branch { target: usize, fallthrough: usize },
+    Fallthrough { next: usize },
+    Unreachable,
+}
+
+impl Terminator {
+    fn successor_pcs(&self) -> Vec<usize> {
+        match self {
+            Terminator::Exit | Terminator::Unreachable => vec![],
+
+            Terminator::Jump { target } => vec![*target],
+
+            Terminator::Branch {
+                target,
+                fallthrough,
+            } => {
+                if target == fallthrough {
+                    vec![*target]
+                } else {
+                    vec![*target, *fallthrough]
+                }
+            }
+
+            Terminator::Fallthrough { next } => vec![*next],
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Function {
+    id: usize,
+    entry_pc: usize,
+    entry_block: usize,
+    blocks: Vec<usize>,
+    // NOTE: does not include calls
+    reachable_from_program_entry: bool,
+    callees: BTreeSet<usize>,
+}
+
+impl Function {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn entry_pc(&self) -> usize {
+        self.entry_pc
+    }
+
+    pub fn entry_block(&self) -> usize {
+        self.entry_block
+    }
+
+    pub fn blocks(&self) -> &[usize] {
+        &self.blocks
+    }
+
+    pub fn reachable_from_program_entry(&self) -> bool {
+        self.reachable_from_program_entry
+    }
+
+    pub fn callees(&self) -> &BTreeSet<usize> {
+        &self.callees
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum AnalyzerError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    Disassembler(#[from] sbpf_disassembler::errors::DisassemblerError),
+
+    #[error(transparent)]
+    Sbpf(#[from] sbpf_common::errors::SBPFError),
+
+    #[error("Instruction metadata does not exist")]
+    InvalidIxMeta,
+
+    #[error("Program count does not exist")]
+    InvalidPc { pc: usize },
+
+    #[error("Basic block does not exist")]
+    InvalidBB,
+
+    #[error("No text section found in program")]
+    InvalidTextSection,
+}
+
+pub fn get_binary_info(path: &str) -> Result<BinaryInfo, AnalyzerError> {
+    Ok(analyze_program(path)?.binary_info)
+}
+
+fn extract_program_from_file(path: &str) -> Result<(Program, usize), AnalyzerError> {
+    let mut file = File::open(path)?;
+    let mut b = vec![];
+    file.read_to_end(&mut b)?;
+    Ok((Program::from_bytes(&b)?, b.len()))
+}
+
+pub fn analyze_program(path: &str) -> Result<ProgramAnalysis, AnalyzerError> {
+    let (program, program_size) = extract_program_from_file(path)?;
+
+    let text_section = &program
+        .section_header_entries
+        .iter()
+        .find(|sect| sect.label == ".text\0")
+        .ok_or(AnalyzerError::InvalidTextSection)?
+        .data;
+
+    let text_section_size = text_section.len();
+
+    let is_sbpf_v2 =
+        program.elf_header.e_flags == 0x02 && program.elf_header.e_machine == E_MACHINE_SBPF;
+
+    let ixs_meta = extract_instructions(text_section, is_sbpf_v2)?;
+    let func_entries = extract_function_entries(&ixs_meta)?;
+    let bbs = extract_basic_blocks(&ixs_meta, &func_entries)?;
+    let funcs = extract_functions(&bbs, &func_entries, &ixs_meta)?;
+
+    let ix_count = ixs_meta.len();
+
+    let ixs = program.to_ixs()?.0;
+    let max_stack_offset = ixs
+        .iter()
+        .filter(|ix| is_stack_access(ix))
+        .filter_map(|ix| ix.off.as_ref())
+        .filter_map(|off| off.as_ref().right())
+        .filter(|off| **off < 0)
+        .map(|off| (-off) as usize)
+        .max()
+        .unwrap_or(0);
+
+    Ok(ProgramAnalysis {
+        binary_info: BinaryInfo {
+            size: program_size,
+            ix_count,
+            text_section_size,
+            max_stack_offset,
+        },
+        instructions: ixs_meta,
+        blocks: bbs,
+        functions: funcs,
+    })
+}
+
+fn is_stack_access(ins: &Instruction) -> bool {
     let is_mem = matches!(
         ins.opcode,
         Opcode::Stb
@@ -29,77 +289,10 @@ pub fn is_stack_access(ins: &Instruction) -> bool {
     is_mem && is_r10
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct BinaryInfo {
-    pub size: usize,
-    pub ix_count: usize,
-    pub text_section_size: usize,
-    pub max_stack_offset: usize,
-}
-
-#[derive(Debug)]
-pub struct ProgramAnalysis {
-    pub binary_info: BinaryInfo,
-    pub instructions: Vec<InstructionMetadata>,
-    pub blocks: Vec<BasicBlock>,
-    pub functions: Vec<Function>,
-}
-
-pub fn get_binary_info(path: &str) -> BinaryInfo {
-    analyze_program(path).binary_info
-}
-
-pub fn analyze_program(path: &str) -> ProgramAnalysis {
-    let mut file = File::open(path).unwrap();
-    let mut b = vec![];
-    file.read_to_end(&mut b).unwrap();
-    let program = Program::from_bytes(&b).unwrap();
-    let text_section = program
-        .section_header_entries
-        .iter()
-        .filter(|sect| sect.label == ".text\0")
-        .collect::<Vec<_>>()[0]
-        .data
-        .clone();
-
-    let size = b.len();
-    let text_section_size = text_section.len();
-
-    let is_sbpf_v2 =
-        program.elf_header.e_flags == 0x02 && program.elf_header.e_machine == E_MACHINE_SBPF;
-
-    let ixs_meta = extract_instructions(text_section, is_sbpf_v2);
-    let func_entries = extract_function_entries(&ixs_meta);
-    let bbs = extract_basic_blocks(&ixs_meta, &func_entries);
-    let funcs = extract_functions(&bbs, &func_entries, &ixs_meta);
-
-    let ix_count = ixs_meta.len();
-
-    let ixs = program.to_ixs().unwrap().0;
-    let max_stack_offset = ixs
-        .iter()
-        .filter(|ix| is_stack_access(ix))
-        .filter_map(|ix| ix.off.clone())
-        .filter_map(|off| off.right())
-        .filter(|off| *off < 0)
-        .map(|off| (-off) as usize)
-        .max()
-        .unwrap_or(0);
-
-    ProgramAnalysis {
-        binary_info: BinaryInfo {
-            size,
-            ix_count,
-            text_section_size,
-            max_stack_offset,
-        },
-        instructions: ixs_meta,
-        blocks: bbs,
-        functions: funcs,
-    }
-}
-
-pub fn extract_instructions(text_section: Vec<u8>, is_sbpf_v2: bool) -> Vec<InstructionMetadata> {
+fn extract_instructions(
+    text_section: &[u8],
+    is_sbpf_v2: bool,
+) -> Result<Vec<InstructionMetadata>, AnalyzerError> {
     let mut pc = 0;
     let mut ixs: Vec<InstructionMetadata> = Vec::new();
 
@@ -117,9 +310,9 @@ pub fn extract_instructions(text_section: Vec<u8>, is_sbpf_v2: bool) -> Vec<Inst
         let window = &text_section[pc..pc + window_len];
 
         let ix = if is_sbpf_v2 {
-            Instruction::from_bytes_sbpf_v2(window).unwrap()
+            Instruction::from_bytes_sbpf_v2(window)?
         } else {
-            Instruction::from_bytes(window).unwrap()
+            Instruction::from_bytes(window)?
         };
 
         let ix_span_len = ix.span.len();
@@ -135,14 +328,14 @@ pub fn extract_instructions(text_section: Vec<u8>, is_sbpf_v2: bool) -> Vec<Inst
         ixs.push(ix_metadata);
     }
 
-    ixs
+    Ok(ixs)
 }
 
-pub fn extract_basic_blocks(
-    ixs_meta: &Vec<InstructionMetadata>,
+fn extract_basic_blocks(
+    ixs_meta: &[InstructionMetadata],
     func_entrypoints: &BTreeSet<usize>,
-) -> Vec<BasicBlock> {
-    let last_ix = ixs_meta.last().unwrap();
+) -> Result<Vec<BasicBlock>, AnalyzerError> {
+    let last_ix = ixs_meta.last().ok_or(AnalyzerError::InvalidIxMeta)?;
     let text_end_pc = last_ix.pc + last_ix.len;
 
     let ix_by_pc = ixs_meta
@@ -160,8 +353,15 @@ pub fn extract_basic_blocks(
     for meta in ixs_meta {
         if meta.ix.is_jump() {
             let current_slot = meta.pc as isize / 8;
-            let off = &meta.ix.off.as_ref().unwrap().clone().unwrap_right();
-            let target_slot = current_slot + 1 + *off as isize;
+            let off = &meta
+                .ix
+                .off
+                .as_ref()
+                .ok_or(AnalyzerError::InvalidIxMeta)?
+                .as_ref()
+                .right()
+                .ok_or(AnalyzerError::InvalidIxMeta)?;
+            let target_slot = current_slot + 1 + **off as isize;
 
             if target_slot >= 0 {
                 let target_pc = (target_slot * 8) as usize;
@@ -177,10 +377,11 @@ pub fn extract_basic_blocks(
         }
     }
 
-    let jump_target_pc = |ix: &InstructionMetadata| -> Option<usize> {
-        let current_slot = ix.pc as isize / 8;
-        let off = *ix.ix.off.as_ref().unwrap().as_ref().right().unwrap();
-        let target_slot = current_slot + 1 + off as isize;
+    // TODO: can I reuse this?
+    let jump_target_pc = |ix_meta: &InstructionMetadata| -> Option<usize> {
+        let current_slot = ix_meta.pc as isize / 8;
+        let off = *&ix_meta.ix.off.as_ref()?.as_ref().right()?;
+        let target_slot = current_slot + 1 + *off as isize;
 
         if target_slot < 0 {
             return None;
@@ -208,21 +409,23 @@ pub fn extract_basic_blocks(
             .iter()
             .take_while(|meta| meta.pc < end)
             .last()
-            .unwrap();
+            .ok_or(AnalyzerError::InvalidIxMeta)?;
 
         let terminator = match last.ix.opcode {
             Opcode::Exit => Terminator::Exit,
             Opcode::Ja => {
-                let target = jump_target_pc(last).unwrap();
+                let target =
+                    jump_target_pc(last).ok_or(AnalyzerError::InvalidPc { pc: last.pc })?;
                 Terminator::Jump { target }
             }
 
             _ if last.ix.is_jump() => {
-                let target = jump_target_pc(last).unwrap();
+                let target =
+                    jump_target_pc(last).ok_or(AnalyzerError::InvalidPc { pc: last.pc })?;
                 let fallthrough = last.pc + last.len;
 
                 if !ix_by_pc.contains_key(&fallthrough) {
-                    panic!("conditional jump has invalid fallthrough as pc {}", last.pc);
+                    return Err(AnalyzerError::InvalidPc { pc: last.pc });
                 }
 
                 Terminator::Branch {
@@ -237,10 +440,7 @@ pub fn extract_basic_blocks(
                 } else if next == text_end_pc {
                     Terminator::Unreachable
                 } else {
-                    panic!(
-                        "non-terminal block has invalid fallthrough at pc {}",
-                        last.pc
-                    );
+                    return Err(AnalyzerError::InvalidPc { pc: last.pc });
                 }
             }
         };
@@ -248,7 +448,7 @@ pub fn extract_basic_blocks(
         let successors = terminator
             .successor_pcs()
             .into_iter()
-            .map(|pc| *bb_by_pc.get(&pc).unwrap())
+            .filter_map(|pc| bb_by_pc.get(&pc).copied())
             .collect::<Vec<_>>();
 
         bbs.push(BasicBlock {
@@ -261,7 +461,6 @@ pub fn extract_basic_blocks(
         })
     }
 
-    //  if i is in bb.successors insert id in predecessors
     for i in 0..bbs.len() {
         let mut predecessors = BTreeSet::new();
 
@@ -276,10 +475,10 @@ pub fn extract_basic_blocks(
         bbs[i].predecessors = predecessors;
     }
 
-    bbs
+    Ok(bbs)
 }
 
-pub fn reach_bb(
+fn reach_bb(
     bbs: &[BasicBlock],
     entry_id: usize,
     func_entries_bbs: Option<&BTreeSet<usize>>,
@@ -310,8 +509,10 @@ pub fn reach_bb(
     reached
 }
 
-fn extract_function_entries(ixs_meta: &Vec<InstructionMetadata>) -> BTreeSet<usize> {
-    let last_ix = ixs_meta.last().unwrap();
+fn extract_function_entries(
+    ixs_meta: &[InstructionMetadata],
+) -> Result<BTreeSet<usize>, AnalyzerError> {
+    let last_ix = ixs_meta.last().ok_or(AnalyzerError::InvalidIxMeta)?;
     let text_end_pc = last_ix.pc + last_ix.len;
 
     let calls = ixs_meta
@@ -325,9 +526,17 @@ fn extract_function_entries(ixs_meta: &Vec<InstructionMetadata>) -> BTreeSet<usi
     let mut incoming_call_counts = BTreeMap::<usize, usize>::new();
 
     for call in &calls {
-        let imm = match call.ix.imm.as_ref().unwrap().as_ref().right().unwrap() {
+        let imm = match call
+            .ix
+            .imm
+            .as_ref()
+            .ok_or(AnalyzerError::InvalidIxMeta)?
+            .as_ref()
+            .right()
+            .ok_or(AnalyzerError::InvalidIxMeta)?
+        {
             Number::Int(n) => *n,
-            _ => panic!("expected call imm int"),
+            _ => return Err(AnalyzerError::InvalidIxMeta),
         };
 
         let target_pc = call.pc as i64 + 8 + imm * 8;
@@ -345,14 +554,14 @@ fn extract_function_entries(ixs_meta: &Vec<InstructionMetadata>) -> BTreeSet<usi
     func_entrypoints.insert(0);
     func_entrypoints.extend(incoming_call_counts.keys().copied());
 
-    func_entrypoints
+    Ok(func_entrypoints)
 }
 
 fn extract_functions(
     bbs: &[BasicBlock],
     func_entries: &BTreeSet<usize>,
-    ixs_meta: &Vec<InstructionMetadata>,
-) -> Vec<Function> {
+    ixs_meta: &[InstructionMetadata],
+) -> Result<Vec<Function>, AnalyzerError> {
     let mut funcs = Vec::new();
 
     let bb_by_pc = bbs
@@ -364,11 +573,11 @@ fn extract_functions(
 
     let func_entry_bbs = func_entries
         .iter()
-        .map(|pc| bb_by_pc.get(pc).unwrap().id)
+        .filter_map(|pc| bb_by_pc.get(pc).map(|bb| bb.id))
         .collect::<BTreeSet<_>>();
 
     for pc in func_entries {
-        let bb = bb_by_pc.get(pc).unwrap();
+        let bb = bb_by_pc.get(pc).ok_or(AnalyzerError::InvalidBB)?;
         leader_bbs.push(bb);
     }
 
@@ -380,7 +589,7 @@ fn extract_functions(
     for (id, leader_bb) in leader_bbs.iter().enumerate() {
         funcs.push(Function {
             id,
-            entry_pc: leader_bb.start_pc as u64,
+            entry_pc: leader_bb.start_pc,
             entry_block: leader_bb.id,
             blocks: reach_bb(&bbs, leader_bb.id, Some(&func_entry_bbs)),
             reachable_from_program_entry: live_blocks.contains(&leader_bb.id),
@@ -388,38 +597,36 @@ fn extract_functions(
         });
     }
 
-    // turn pc to function id
     let func_id_by_pc = funcs
         .iter()
         .map(|func| (func.entry_pc as usize, func.id))
         .collect::<BTreeMap<usize, usize>>();
 
     for i in 0..funcs.len() {
-        let callees = extract_function_callees(&funcs[i].blocks, bbs, func_entries, ixs_meta)
+        let callees = extract_function_callees(&funcs[i].blocks, bbs, func_entries, ixs_meta)?
             .iter()
-            .map(|pc| *func_id_by_pc.get(pc).unwrap())
+            .filter_map(|pc| *&func_id_by_pc.get(pc).map(|bb| *bb))
             .collect();
 
         funcs[i].callees = callees;
     }
 
-    funcs
+    Ok(funcs)
 }
 
-pub fn extract_function_callees(
+fn extract_function_callees(
     blocks: &[usize],
     bbs: &[BasicBlock],
     func_entries: &BTreeSet<usize>,
-    ixs_meta: &Vec<InstructionMetadata>,
-) -> BTreeSet<usize> {
+    ixs_meta: &[InstructionMetadata],
+) -> Result<BTreeSet<usize>, AnalyzerError> {
     let bb_by_block_id = bbs.iter().map(|bb| (bb.id, bb)).collect::<BTreeMap<_, _>>();
 
     let bbs = blocks
         .iter()
-        .map(|bb_id| *bb_by_block_id.get(bb_id).unwrap())
+        .filter_map(|bb_id| *&bb_by_block_id.get(bb_id).map(|bb| *bb))
         .collect::<Vec<&BasicBlock>>();
 
-    // NOTE: improve name
     let ixs_by_bb_id: BTreeMap<usize, Vec<&InstructionMetadata>> = bbs
         .iter()
         .map(|bb| {
@@ -447,9 +654,17 @@ pub fn extract_function_callees(
     let mut res = BTreeSet::new();
 
     for call in &calls {
-        let imm = match call.ix.imm.as_ref().unwrap().as_ref().right().unwrap() {
+        let imm = match call
+            .ix
+            .imm
+            .as_ref()
+            .ok_or(AnalyzerError::InvalidIxMeta)?
+            .as_ref()
+            .right()
+            .ok_or(AnalyzerError::InvalidIxMeta)?
+        {
             Number::Int(n) => *n,
-            _ => panic!("expected call imm int"),
+            _ => return Err(AnalyzerError::InvalidIxMeta),
         };
 
         if imm != -1 {
@@ -460,65 +675,5 @@ pub fn extract_function_callees(
             }
         }
     }
-    res
-}
-
-#[derive(Debug)]
-pub struct InstructionMetadata {
-    pub pc: usize,
-    pub len: usize,
-    pub ix: Instruction,
-}
-
-#[derive(Debug)]
-pub struct BasicBlock {
-    pub id: usize,
-    pub start_pc: usize,
-    pub end_pc_exclusive: usize,
-    pub terminator: Terminator,
-    pub successors: Vec<usize>,
-    pub predecessors: BTreeSet<usize>,
-}
-
-#[derive(Debug)]
-pub enum Terminator {
-    Exit,
-    Jump { target: usize },
-    Branch { target: usize, fallthrough: usize },
-    Fallthrough { next: usize },
-    Unreachable,
-}
-
-impl Terminator {
-    pub fn successor_pcs(&self) -> Vec<usize> {
-        match self {
-            Terminator::Exit | Terminator::Unreachable => vec![],
-
-            Terminator::Jump { target } => vec![*target],
-
-            Terminator::Branch {
-                target,
-                fallthrough,
-            } => {
-                if target == fallthrough {
-                    vec![*target]
-                } else {
-                    vec![*target, *fallthrough]
-                }
-            }
-
-            Terminator::Fallthrough { next } => vec![*next],
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Function {
-    pub id: usize,
-    pub entry_pc: u64,
-    pub entry_block: usize,
-    pub blocks: Vec<usize>,
-    // NOTE: does not include calls
-    pub reachable_from_program_entry: bool,
-    pub callees: BTreeSet<usize>,
+    Ok(res)
 }
