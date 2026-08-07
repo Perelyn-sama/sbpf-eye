@@ -466,10 +466,22 @@ fn extract_basic_blocks(
     Ok(bbs)
 }
 
-fn reach_bb(
+fn reach_bb(bbs: &[BasicBlock], entry_id: usize) -> Vec<usize> {
+    reach_bb_with_boundary(bbs, entry_id, None)
+}
+
+fn reach_bb_until_function_boundary(
     bbs: &[BasicBlock],
     entry_id: usize,
-    func_entries_bbs: Option<&BTreeSet<usize>>,
+    func_entries_bbs: &BTreeSet<usize>,
+) -> Vec<usize> {
+    reach_bb_with_boundary(bbs, entry_id, Some(func_entries_bbs))
+}
+
+fn reach_bb_with_boundary(
+    bbs: &[BasicBlock],
+    entry_id: usize,
+    boundary_blocks: Option<&BTreeSet<usize>>,
 ) -> Vec<usize> {
     let mut reached = Vec::new();
     let mut visited = BTreeSet::new();
@@ -484,11 +496,11 @@ fn reach_bb(
         reached.push(id);
 
         for successor in &bbs[id].successors {
-            if !visited.contains(successor)
-                && !func_entries_bbs
-                    .as_ref()
-                    .is_some_and(|entries| entries.contains(successor))
-            {
+            let is_boundary = boundary_blocks
+                .as_ref()
+                .is_some_and(|blocks| blocks.contains(successor));
+
+            if !visited.contains(successor) && !is_boundary {
                 to_visit.push(*successor);
             }
         }
@@ -569,13 +581,10 @@ fn extract_functions(
         leader_bbs.push(bb);
     }
 
-    let live_blocks = reach_bb(bbs, 0, None)
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    let live_blocks = reach_bb(bbs, 0).iter().copied().collect::<BTreeSet<_>>();
 
     for (id, leader_bb) in leader_bbs.iter().enumerate() {
-        let blocks = reach_bb(&bbs, leader_bb.id, Some(&func_entry_bbs));
+        let blocks = reach_bb_until_function_boundary(&bbs, leader_bb.id, &func_entry_bbs);
 
         let mut local_stack_usage = 0;
 
@@ -719,6 +728,40 @@ mod tests {
         let entries = extract_function_entries(ixs_meta).unwrap();
         let bbs = extract_basic_blocks(ixs_meta, &entries).unwrap();
         extract_functions(&bbs, &entries, ixs_meta).unwrap()
+    }
+
+    #[test]
+    fn reach_bb_crosses_function_boundaries_unless_bounded() {
+        let ixs_meta = vec![
+            ix(0, Opcode::Stw, 10, 0, -8, 0),
+            ix(8, Opcode::JeqImm, 0, 0, 2, 0),
+            ix(16, Opcode::Ldxw, 1, 10, -32, 0),
+            ix(24, Opcode::Ja, 0, 0, 1, 0),
+            ix(32, Opcode::Stw, 10, 0, 128, 0),
+            ix(40, Opcode::Call, 0, 0, 0, 0),
+            ix(48, Opcode::Stxdw, 10, 1, -64, 0),
+            ix(56, Opcode::Exit, 0, 0, 0, 0),
+        ];
+
+        let entries = extract_function_entries(&ixs_meta).unwrap();
+        let bbs = extract_basic_blocks(&ixs_meta, &entries).unwrap();
+
+        let bb_by_pc = bbs
+            .iter()
+            .map(|bbs| (bbs.start_pc, bbs))
+            .collect::<BTreeMap<_, _>>();
+
+        let func_entry_bbs = entries
+            .iter()
+            .filter_map(|pc| bb_by_pc.get(pc).map(|bb| bb.id))
+            .collect::<BTreeSet<_>>();
+
+        let reached_without_bound = reach_bb(&bbs, 0);
+        let reached_with_bound = reach_bb_until_function_boundary(&bbs, 0, &func_entry_bbs);
+
+        assert_eq!(func_entry_bbs, BTreeSet::from([0, 4]));
+        assert_eq!(reached_without_bound, vec![0, 1, 3, 4, 2]);
+        assert_eq!(reached_with_bound, vec![0, 1, 3, 2]);
     }
 
     #[test]
