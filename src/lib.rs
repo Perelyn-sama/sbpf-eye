@@ -12,7 +12,6 @@ pub struct BinaryInfo {
     size: usize,
     ix_count: usize,
     text_section_size: usize,
-    max_stack_offset: usize,
 }
 
 impl BinaryInfo {
@@ -26,10 +25,6 @@ impl BinaryInfo {
 
     pub fn text_section_size(&self) -> usize {
         self.text_section_size
-    }
-
-    pub fn max_stack_offset(&self) -> usize {
-        self.max_stack_offset
     }
 }
 
@@ -157,6 +152,7 @@ pub struct Function {
     // NOTE: does not include calls
     reachable_from_program_entry: bool,
     callees: BTreeSet<usize>,
+    local_stack_usage: usize,
 }
 
 impl Function {
@@ -182,6 +178,10 @@ impl Function {
 
     pub fn callees(&self) -> &BTreeSet<usize> {
         &self.callees
+    }
+
+    pub fn local_stack_usage(&self) -> usize {
+        self.local_stack_usage
     }
 }
 
@@ -242,23 +242,11 @@ pub fn analyze_program(path: &str) -> Result<ProgramAnalysis, AnalyzerError> {
 
     let ix_count = ixs_meta.len();
 
-    let ixs = program.to_ixs()?.0;
-    let max_stack_offset = ixs
-        .iter()
-        .filter(|ix| is_stack_access(ix))
-        .filter_map(|ix| ix.off.as_ref())
-        .filter_map(|off| off.as_ref().right())
-        .filter(|off| **off < 0)
-        .map(|off| (-off) as usize)
-        .max()
-        .unwrap_or(0);
-
     Ok(ProgramAnalysis {
         binary_info: BinaryInfo {
             size: program_size,
             ix_count,
             text_section_size,
-            max_stack_offset,
         },
         instructions: ixs_meta,
         blocks: bbs,
@@ -587,13 +575,44 @@ fn extract_functions(
         .collect::<BTreeSet<_>>();
 
     for (id, leader_bb) in leader_bbs.iter().enumerate() {
+        let blocks = reach_bb(&bbs, leader_bb.id, Some(&func_entry_bbs));
+
+        let mut local_stack_usage = 0;
+
+        for block_id in &blocks {
+            let bb = &bbs[*block_id];
+            debug_assert_eq!(bb.id, *block_id);
+
+            let start = bb.start_pc();
+            let end = bb.end_pc_exclusive();
+
+            let ixs: Vec<&Instruction> = ixs_meta
+                .iter()
+                .filter(|ix_meta| ix_meta.pc >= start && ix_meta.pc < end)
+                .map(|ix_meta| &ix_meta.ix)
+                .collect();
+
+            let bb_stack_usage = ixs
+                .iter()
+                .filter(|ix| is_stack_access(ix))
+                .filter_map(|ix| ix.off.as_ref())
+                .filter_map(|off| off.as_ref().right())
+                .filter(|off| **off < 0)
+                .map(|off| (-off) as usize)
+                .max()
+                .unwrap_or(0);
+
+            local_stack_usage = local_stack_usage.max(bb_stack_usage);
+        }
+
         funcs.push(Function {
             id,
             entry_pc: leader_bb.start_pc,
             entry_block: leader_bb.id,
-            blocks: reach_bb(&bbs, leader_bb.id, Some(&func_entry_bbs)),
+            blocks,
             reachable_from_program_entry: live_blocks.contains(&leader_bb.id),
             callees: BTreeSet::new(),
+            local_stack_usage,
         });
     }
 
@@ -676,4 +695,64 @@ fn extract_function_callees(
         }
     }
     Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ix(pc: usize, opcode: Opcode, dst: u8, src: u8, off: i16, imm: i32) -> InstructionMetadata {
+        let mut bytes = vec![opcode.into(), src << 4 | dst];
+        bytes.extend_from_slice(&off.to_le_bytes());
+        bytes.extend_from_slice(&imm.to_le_bytes());
+
+        let ix = Instruction::from_bytes(&bytes).unwrap();
+
+        InstructionMetadata {
+            pc,
+            len: ix.span.len(),
+            ix,
+        }
+    }
+
+    fn extract_test_functions(ixs_meta: &[InstructionMetadata]) -> Vec<Function> {
+        let entries = extract_function_entries(ixs_meta).unwrap();
+        let bbs = extract_basic_blocks(ixs_meta, &entries).unwrap();
+        extract_functions(&bbs, &entries, ixs_meta).unwrap()
+    }
+
+    #[test]
+    fn local_stack_usage_is_max_negative_r10_offset_per_function() {
+        let ixs_meta = vec![
+            ix(0, Opcode::Stw, 10, 0, -8, 0),
+            ix(8, Opcode::Ldxw, 1, 10, -32, 0),
+            ix(16, Opcode::Stw, 10, 0, 128, 0),
+            ix(24, Opcode::Call, 0, 0, 0, 1),
+            ix(32, Opcode::Exit, 0, 0, 0, 0),
+            ix(40, Opcode::Stxdw, 10, 1, -64, 0),
+            ix(48, Opcode::Exit, 0, 0, 0, 0),
+        ];
+
+        let funcs = extract_test_functions(&ixs_meta);
+
+        assert_eq!(funcs.len(), 2);
+        assert_eq!(funcs[0].entry_pc(), 0);
+        assert_eq!(funcs[0].local_stack_usage(), 32);
+        assert_eq!(funcs[1].entry_pc(), 40);
+        assert_eq!(funcs[1].local_stack_usage(), 64);
+    }
+
+    #[test]
+    fn local_stack_usage_is_zero_without_negative_r10_memory_accesses() {
+        let ixs_meta = vec![
+            ix(0, Opcode::Stw, 1, 0, -128, 0),
+            ix(8, Opcode::Stw, 10, 0, 8, 0),
+            ix(16, Opcode::Exit, 0, 0, 0, 0),
+        ];
+
+        let funcs = extract_test_functions(&ixs_meta);
+
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].local_stack_usage(), 0);
+    }
 }

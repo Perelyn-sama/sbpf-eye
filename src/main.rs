@@ -227,11 +227,10 @@ impl App {
         Line::from(vec![
             Span::styled(self.path.clone(), Style::default().fg(Color::Cyan)),
             Span::raw(format!(
-                "  size={} text={} instructions={} max_stack={}",
+                "  size={} text={} instructions={}",
                 info.size(),
                 info.text_section_size(),
-                info.ix_count(),
-                info.max_stack_offset()
+                info.ix_count()
             )),
         ])
     }
@@ -362,10 +361,11 @@ fn move_list_selection(state: &mut ListState, len: usize, delta: isize) {
 
 fn function_line(func: &Function) -> Line<'static> {
     Line::from(format!(
-        "#{:<3} pc={:<5} blocks={:<3} live={} calls={:?}",
+        "#{:<3} pc={:<5} blocks={:<3} stack={:<4} live={} calls={:?}",
         func.id(),
         func.entry_pc(),
         func.blocks().len(),
+        func.local_stack_usage(),
         func.reachable_from_program_entry(),
         func.callees()
     ))
@@ -393,10 +393,11 @@ fn instruction_line(ix: &InstructionMetadata) -> Line<'static> {
 
 fn function_detail(func: &Function) -> String {
     format!(
-        "id: {}\nentry_pc: {}\nentry_block: {}\nreachable_from_program_entry: {}\nblocks: {:?}\ncallees: {:?}",
+        "id: {}\nentry_pc: {}\nentry_block: {}\nlocal_stack_usage: {}\nreachable_from_program_entry: {}\nblocks: {:?}\ncallees: {:?}",
         func.id(),
         func.entry_pc(),
         func.entry_block(),
+        func.local_stack_usage(),
         func.reachable_from_program_entry(),
         func.blocks(),
         func.callees()
