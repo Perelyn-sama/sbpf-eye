@@ -227,7 +227,8 @@ impl App {
         Line::from(vec![
             Span::styled(self.path.clone(), Style::default().fg(Color::Cyan)),
             Span::raw(format!(
-                "  size={} text={} instructions={}",
+                "  sBPF=v{} size={} text={} instructions={}",
+                info.sbpf_version(),
                 info.size(),
                 info.text_section_size(),
                 info.ix_count()

@@ -9,12 +9,18 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BinaryInfo {
+    sbpf_version: u32,
     size: usize,
     ix_count: usize,
     text_section_size: usize,
 }
 
 impl BinaryInfo {
+    /// The sBPF version recorded in the ELF header's `e_flags` field.
+    pub fn sbpf_version(&self) -> u32 {
+        self.sbpf_version
+    }
+
     pub fn size(&self) -> usize {
         self.size
     }
@@ -244,6 +250,7 @@ pub fn analyze_program(path: &str) -> Result<ProgramAnalysis, AnalyzerError> {
 
     Ok(ProgramAnalysis {
         binary_info: BinaryInfo {
+            sbpf_version: program.elf_header.e_flags,
             size: program_size,
             ix_count,
             text_section_size,
