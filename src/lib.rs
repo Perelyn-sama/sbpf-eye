@@ -706,6 +706,90 @@ fn extract_function_callees(
     Ok(res)
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum StackUsageError {
+    #[error("function index {id} is out of bounds (function count: {function_count})")]
+    InvalidFunctionIndex { id: usize, function_count: usize },
+    #[error("function at index {index} has ID {id}")]
+    FunctionIdMismatch { index: usize, id: usize },
+    #[error("recursive call cycle detected on edge {caller} -> {callee}")]
+    Cycle { caller: usize, callee: usize },
+    #[error("cumulative stack estimate overflows usize at function {id}")]
+    Overflow { id: usize },
+}
+
+/// Maximum sum of local stack estimates along a call chain from `entry_id`.
+///
+/// Uses iterative DFS and memoization, so deep chains do not consume the Rust
+/// call stack and shared callees are evaluated once per invocation. Takes
+/// O(funcs.len() + reachable edges) time and O(funcs.len()) auxiliary memory.
+/// Only reachable functions are validated: their IDs must match slice indices.
+/// Returns an error for invalid indices, mismatched IDs, cycles (including
+/// zero-cost cycles), or arithmetic overflow. Unreachable defects are ignored.
+///
+/// This remains an estimate based on the supplied local usage and call edges;
+/// it does not account for call overhead, tail calls, or missing call targets.
+pub fn cumulative_stack_usage(
+    funcs: &[Function],
+    entry_id: usize,
+) -> Result<usize, StackUsageError> {
+    let function_at = |index: usize| -> Result<&Function, StackUsageError> {
+        let func = funcs
+            .get(index)
+            .ok_or(StackUsageError::InvalidFunctionIndex {
+                id: index,
+                function_count: funcs.len(),
+            })?;
+        if func.id() != index {
+            return Err(StackUsageError::FunctionIdMismatch {
+                index,
+                id: func.id(),
+            });
+        }
+        Ok(func)
+    };
+
+    let entry = function_at(entry_id)?;
+    let mut totals = vec![None; funcs.len()];
+    let mut active = vec![false; funcs.len()];
+    // Each frame retains its callee iterator and largest completed child total.
+    let mut stack = vec![(entry_id, entry.callees().iter(), 0usize)];
+    active[entry_id] = true;
+
+    while let Some((id, callees, callee_max)) = stack.last_mut() {
+        if let Some(&callee) = callees.next() {
+            let func = function_at(callee)?;
+            if active[callee] {
+                return Err(StackUsageError::Cycle {
+                    caller: *id,
+                    callee,
+                });
+            }
+            if let Some(total) = totals[callee] {
+                *callee_max = (*callee_max).max(total);
+            } else {
+                active[callee] = true;
+                stack.push((callee, func.callees().iter(), 0));
+            }
+        } else {
+            let id = *id;
+            let total = funcs[id]
+                .local_stack_usage()
+                .checked_add(*callee_max)
+                .ok_or(StackUsageError::Overflow { id })?;
+            totals[id] = Some(total);
+            active[id] = false;
+            stack.pop();
+            if let Some((_, _, parent_max)) = stack.last_mut() {
+                *parent_max = (*parent_max).max(total);
+            } else {
+                return Ok(total);
+            }
+        }
+    }
+    unreachable!("the entry frame returns a result when completed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,5 +881,32 @@ mod tests {
 
         assert_eq!(funcs.len(), 1);
         assert_eq!(funcs[0].local_stack_usage(), 0);
+    }
+
+    fn function(id: usize, local_stack_usage: usize, callees: &[usize]) -> Function {
+        Function {
+            id,
+            entry_pc: 0,
+            entry_block: 0,
+            blocks: vec![],
+            reachable_from_program_entry: false,
+            callees: callees.iter().copied().collect(),
+            local_stack_usage,
+        }
+    }
+
+    #[test]
+    fn cumulative_stack_uses_heaviest_path_and_requested_entry() {
+        let funcs = vec![
+            function(0, 10, &[1, 2]),
+            function(1, 20, &[3]),
+            function(2, 30, &[3]),
+            function(3, 40, &[]),
+            function(4, 1000, &[]),
+        ];
+        assert_eq!(cumulative_stack_usage(&funcs, 0), Ok(80));
+        assert_eq!(cumulative_stack_usage(&funcs, 1), Ok(60));
+        assert_eq!(cumulative_stack_usage(&funcs, 3), Ok(40));
+        assert_eq!(cumulative_stack_usage(&[function(0, 0, &[])], 0), Ok(0));
     }
 }

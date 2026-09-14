@@ -110,7 +110,7 @@ impl App {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(10),
-                Constraint::Length(9),
+                Constraint::Length(10),
             ])
             .split(frame.area());
 
@@ -333,7 +333,19 @@ impl App {
         match self.active_pane {
             ActivePane::Functions => self
                 .selected_function()
-                .map(function_detail)
+                .map(|func| {
+                    let stack = match sbpf_eye::cumulative_stack_usage(
+                        self.analysis.functions(),
+                        func.id(),
+                    ) {
+                        Ok(bytes) => format!("{bytes} bytes"),
+                        Err(error) => format!("unavailable: {error}"),
+                    };
+                    format!(
+                        "{}\ncumulative_stack_usage (estimate): {stack}",
+                        function_detail(func)
+                    )
+                })
                 .unwrap_or_else(|| "No function selected".to_string()),
             ActivePane::Blocks => self
                 .selected_block()
