@@ -1,11 +1,39 @@
+pub mod compiler_diff;
 use sbpf_common::inst_param::Number;
 use sbpf_common::{instruction::Instruction, opcode::Opcode};
 use sbpf_disassembler::elf_header::E_MACHINE_SBPF;
 use sbpf_disassembler::program::Program;
+use sbpf_disassembler::program_header::{PF_W, PF_X};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::{fs::File, io::Read};
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElfSizes {
+    pub file: usize,
+    pub code: usize,
+    pub read_only_data: usize,
+    pub writable_data: usize,
+    pub metadata: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackModel {
+    FixedFrame,
+    DynamicFrame,
+    Unknown,
+}
+
+impl StackModel {
+    pub fn for_sbpf_version(version: u32) -> Self {
+        match version {
+            0 | 3 => Self::FixedFrame,
+            1 | 2 => Self::DynamicFrame,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BinaryInfo {
@@ -13,6 +41,8 @@ pub struct BinaryInfo {
     size: usize,
     ix_count: usize,
     text_section_size: usize,
+    elf_sizes: ElfSizes,
+    stack_model: StackModel,
 }
 
 impl BinaryInfo {
@@ -31,6 +61,14 @@ impl BinaryInfo {
 
     pub fn text_section_size(&self) -> usize {
         self.text_section_size
+    }
+
+    pub fn elf_sizes(&self) -> ElfSizes {
+        self.elf_sizes
+    }
+
+    pub fn stack_model(&self) -> StackModel {
+        self.stack_model
     }
 }
 
@@ -74,6 +112,10 @@ impl InstructionMetadata {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub fn instruction(&self) -> &Instruction {
@@ -247,18 +289,50 @@ pub fn analyze_program(path: &str) -> Result<ProgramAnalysis, AnalyzerError> {
     let funcs = extract_functions(&bbs, &func_entries, &ixs_meta)?;
 
     let ix_count = ixs_meta.len();
+    let elf_sizes = elf_sizes(&program, program_size);
+    let sbpf_version = program.elf_header.e_flags;
 
     Ok(ProgramAnalysis {
         binary_info: BinaryInfo {
-            sbpf_version: program.elf_header.e_flags,
+            sbpf_version,
             size: program_size,
             ix_count,
             text_section_size,
+            elf_sizes,
+            stack_model: StackModel::for_sbpf_version(sbpf_version),
         },
         instructions: ixs_meta,
         blocks: bbs,
         functions: funcs,
     })
+}
+
+fn elf_sizes(program: &Program, file_size: usize) -> ElfSizes {
+    let mut code = 0usize;
+    let mut read_only_data = 0usize;
+    let mut writable_data = 0usize;
+
+    for header in &program.program_headers {
+        let size = header.p_filesz as usize;
+        if header.p_flags.0 & PF_X as u32 != 0 {
+            code = code.saturating_add(size);
+        } else if header.p_flags.0 & PF_W as u32 != 0 {
+            writable_data = writable_data.saturating_add(size);
+        } else if size > 0 {
+            read_only_data = read_only_data.saturating_add(size);
+        }
+    }
+
+    let loaded = code
+        .saturating_add(read_only_data)
+        .saturating_add(writable_data);
+    ElfSizes {
+        file: file_size,
+        code,
+        read_only_data,
+        writable_data,
+        metadata: file_size.saturating_sub(loaded),
+    }
 }
 
 fn is_stack_access(ins: &Instruction) -> bool {
@@ -313,9 +387,9 @@ fn extract_instructions(
         let ix_span_len = ix.span.len();
 
         let ix_metadata = InstructionMetadata {
-            pc: pc,
+            pc,
             len: ix_span_len,
-            ix: ix,
+            ix,
         };
 
         pc += ix_span_len;
@@ -348,7 +422,7 @@ fn extract_basic_blocks(
     for meta in ixs_meta {
         if meta.ix.is_jump() {
             let current_slot = meta.pc as isize / 8;
-            let off = &meta
+            let off = meta
                 .ix
                 .off
                 .as_ref()
@@ -356,7 +430,7 @@ fn extract_basic_blocks(
                 .as_ref()
                 .right()
                 .ok_or(AnalyzerError::InvalidIxMeta)?;
-            let target_slot = current_slot + 1 + **off as isize;
+            let target_slot = current_slot + 1 + *off as isize;
 
             if target_slot >= 0 {
                 let target_pc = (target_slot * 8) as usize;
@@ -375,7 +449,7 @@ fn extract_basic_blocks(
     // TODO: can I reuse this?
     let jump_target_pc = |ix_meta: &InstructionMetadata| -> Option<usize> {
         let current_slot = ix_meta.pc as isize / 8;
-        let off = *&ix_meta.ix.off.as_ref()?.as_ref().right()?;
+        let off = ix_meta.ix.off.as_ref()?.as_ref().right()?;
         let target_slot = current_slot + 1 + *off as isize;
 
         if target_slot < 0 {
@@ -450,7 +524,7 @@ fn extract_basic_blocks(
             id: i,
             start_pc: start,
             end_pc_exclusive: end,
-            terminator: terminator,
+            terminator,
             successors,
             predecessors: BTreeSet::new(),
         })
@@ -591,7 +665,7 @@ fn extract_functions(
     let live_blocks = reach_bb(bbs, 0).iter().copied().collect::<BTreeSet<_>>();
 
     for (id, leader_bb) in leader_bbs.iter().enumerate() {
-        let blocks = reach_bb_until_function_boundary(&bbs, leader_bb.id, &func_entry_bbs);
+        let blocks = reach_bb_until_function_boundary(bbs, leader_bb.id, &func_entry_bbs);
 
         let mut local_stack_usage = 0;
 
@@ -634,16 +708,16 @@ fn extract_functions(
 
     let func_id_by_pc = funcs
         .iter()
-        .map(|func| (func.entry_pc as usize, func.id))
+        .map(|func| (func.entry_pc, func.id))
         .collect::<BTreeMap<usize, usize>>();
 
-    for i in 0..funcs.len() {
-        let callees = extract_function_callees(&funcs[i].blocks, bbs, func_entries, ixs_meta)?
+    for func in &mut funcs {
+        let callees = extract_function_callees(&func.blocks, bbs, func_entries, ixs_meta)?
             .iter()
-            .filter_map(|pc| *&func_id_by_pc.get(pc).map(|bb| *bb))
+            .filter_map(|pc| func_id_by_pc.get(pc).copied())
             .collect();
 
-        funcs[i].callees = callees;
+        func.callees = callees;
     }
 
     Ok(funcs)
@@ -659,7 +733,7 @@ fn extract_function_callees(
 
     let bbs = blocks
         .iter()
-        .filter_map(|bb_id| *&bb_by_block_id.get(bb_id).map(|bb| *bb))
+        .filter_map(|bb_id| bb_by_block_id.get(bb_id).copied())
         .collect::<Vec<&BasicBlock>>();
 
     let ixs_by_bb_id: BTreeMap<usize, Vec<&InstructionMetadata>> = bbs
@@ -676,8 +750,8 @@ fn extract_function_callees(
 
     let ixs_in_func = ixs_by_bb_id
         .values()
-        .cloned()
         .flatten()
+        .copied()
         .collect::<Vec<&InstructionMetadata>>();
 
     let calls = ixs_in_func
@@ -800,6 +874,15 @@ pub fn cumulative_stack_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sbpf_v3_uses_fixed_stack_frames() {
+        assert_eq!(StackModel::for_sbpf_version(0), StackModel::FixedFrame);
+        assert_eq!(StackModel::for_sbpf_version(1), StackModel::DynamicFrame);
+        assert_eq!(StackModel::for_sbpf_version(2), StackModel::DynamicFrame);
+        assert_eq!(StackModel::for_sbpf_version(3), StackModel::FixedFrame);
+        assert_eq!(StackModel::for_sbpf_version(99), StackModel::Unknown);
+    }
 
     fn ix(pc: usize, opcode: Opcode, dst: u8, src: u8, off: i16, imm: i32) -> InstructionMetadata {
         let mut bytes = vec![opcode.into(), src << 4 | dst];

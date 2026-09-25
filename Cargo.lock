@@ -534,6 +534,8 @@ dependencies = [
  "ratatui",
  "sbpf-common",
  "sbpf-disassembler",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

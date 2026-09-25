@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -13,13 +13,20 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use sbpf_eye::{BasicBlock, Function, InstructionMetadata, ProgramAnalysis, analyze_program};
-use std::{env, io};
+use std::{env, io, path::PathBuf};
 
 const DEFAULT_PROGRAM: &str = "samples/hello_solana_pinocchio_program.so";
 
 fn main() -> Result<()> {
-    let path = env::args()
-        .nth(1)
+    let mut args = env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "compiler-diff") {
+        args.remove(0);
+        return run_compiler_diff(args);
+    }
+
+    let path = args
+        .first()
+        .cloned()
         .unwrap_or_else(|| DEFAULT_PROGRAM.to_string());
 
     let analysis =
@@ -28,6 +35,87 @@ fn main() -> Result<()> {
     run_tui(path, analysis)?;
 
     Ok(())
+}
+
+fn run_compiler_diff(args: Vec<String>) -> Result<()> {
+    let (program_dir, options, output) = parse_compiler_diff_args(args)?;
+    let keep_builds = options.keep_builds;
+    let report = sbpf_eye::compiler_diff::compile_and_compare(&program_dir, options)
+        .with_context(|| format!("failed to run compiler diff for {}", program_dir.display()))?;
+    let rendered = match output {
+        CompilerDiffOutput::Compact => report.render_compact(),
+        CompilerDiffOutput::Verbose => report.render_verbose(),
+        CompilerDiffOutput::Json => report.to_json()?,
+    };
+    println!("{rendered}");
+    if !keep_builds {
+        report.cleanup_builds();
+    }
+    Ok(())
+}
+
+fn parse_compiler_diff_args(
+    args: Vec<String>,
+) -> Result<(
+    PathBuf,
+    sbpf_eye::compiler_diff::CompilerDiffOptions,
+    CompilerDiffOutput,
+)> {
+    let mut program_dir = None;
+    let mut options = sbpf_eye::compiler_diff::CompilerDiffOptions::default();
+    let mut output = CompilerDiffOutput::Compact;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--versions" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    bail!("--versions requires a comma-separated value like v0,v1,v2,v3");
+                };
+                options.requested_versions = sbpf_eye::compiler_diff::parse_versions(value)?;
+            }
+            "--release" => {
+                options.release = true;
+            }
+            "--keep-builds" => {
+                options.keep_builds = true;
+            }
+            "--verbose" => output = CompilerDiffOutput::Verbose,
+            "--json" => output = CompilerDiffOutput::Json,
+            "--help" | "-h" => {
+                print_compiler_diff_help();
+                std::process::exit(0);
+            }
+            value if value.starts_with('-') => bail!("unknown compiler-diff option `{value}`"),
+            value => {
+                if program_dir.replace(PathBuf::from(value)).is_some() {
+                    bail!("compiler-diff accepts exactly one PROGRAM_DIR");
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let Some(program_dir) = program_dir else {
+        bail!("missing PROGRAM_DIR\n\n{}", compiler_diff_usage());
+    };
+
+    Ok((program_dir, options, output))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompilerDiffOutput {
+    Compact,
+    Verbose,
+    Json,
+}
+
+fn print_compiler_diff_help() {
+    println!("{}", compiler_diff_usage());
+}
+
+fn compiler_diff_usage() -> &'static str {
+    "Usage: sbpf-eye compiler-diff <PROGRAM_DIR> [--versions v0,v1,...] [--release] [--keep-builds] [--verbose | --json]\n\nBy default, all architectures supported by the installed cargo-build-sbf are compared.\nUse --versions to compare only the listed architectures.\nUse --verbose for opcode, function, and ELF details, or --json for complete machine-readable output."
 }
 
 fn run_tui(path: String, analysis: ProgramAnalysis) -> io::Result<()> {
@@ -94,10 +182,10 @@ impl App {
         loop {
             terminal.draw(|frame| self.render(frame))?;
 
-            if let Event::Key(key) = event::read()? {
-                if self.handle_key(key) {
-                    break;
-                }
+            if let Event::Key(key) = event::read()?
+                && self.handle_key(key)
+            {
+                break;
             }
         }
 
