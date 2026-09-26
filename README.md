@@ -27,6 +27,43 @@ Run against a specific SBPF shared object:
 cargo run -- samples/hello_solana_pinocchio_program.so
 ```
 
+## Compiler Diff
+
+Compare the same Rust program across all supported sBPF architectures:
+
+```sh
+cargo run -- compiler-diff <PROGRAM_DIR>
+```
+
+The default report shows build status, a compact summary, and important deltas
+against the lowest successfully built version. Architectures are detected
+automatically; use `--versions` only to limit the comparison:
+
+```sh
+cargo run -- compiler-diff <PROGRAM_DIR> --versions v0,v2,v3
+```
+
+Show opcode changes, function changes, and the detailed ELF size breakdown:
+
+```sh
+cargo run -- compiler-diff <PROGRAM_DIR> --verbose
+```
+
+Emit the complete analysis and comparison as JSON:
+
+```sh
+cargo run -- compiler-diff <PROGRAM_DIR> --json
+```
+
+Keep the separately built ELF files after the report:
+
+```sh
+cargo run -- compiler-diff <PROGRAM_DIR> --keep-builds
+```
+
+`PROGRAM_DIR` must contain the program's `Cargo.toml`. A failed or unsupported
+architecture is reported without stopping the remaining builds.
+
 ## TUI Controls
 
 | Key | Action |
