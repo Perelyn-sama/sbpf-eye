@@ -1,0 +1,17 @@
+{
+  "name": "sbpf-eye-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs",
+    "build:bridge": "cargo build --release --manifest-path bridge/Cargo.toml",
+    "test": "node --test test.mjs",
+    "test:bridge": "cargo test --manifest-path bridge/Cargo.toml",
+    "test:browser": "node browser-test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
