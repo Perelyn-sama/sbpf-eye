@@ -1,11 +1,10 @@
 [package]
 name = "sbpf-eye"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A CLI for inspecting Solana sBPF binaries and comparing compiler output"
 license = "MIT"
 repository = "https://github.com/Perelyn-sama/sbpf-eye"
-readme = "README.md"
 keywords = ["solana", "sbpf", "compiler", "binary", "analysis"]
 categories = ["command-line-utilities", "development-tools"]
 
