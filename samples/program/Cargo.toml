@@ -1,0 +1,31 @@
+[package]
+name = "account-data-pinocchio-program"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pinocchio = { version = "0.11.1", features = ["cpi", "copy", "account-resize"] }
+pinocchio-log = "0.5.1"
+pinocchio-system = "0.6.1"
+solana-compiler-builtins = { git = "https://github.com/blueshift-gg/solana-compiler-builtins", version = "0.2.0" }
+
+[dev-dependencies]
+litesvm = "0.11.0"
+solana-keypair = "3.0.1"
+solana-message = "4.0.0"
+solana-native-token = "3.0.0"
+solana-pubkey = "3.0.0"
+solana-signer = "3.0.0"
+solana-transaction = "3.0.1"
+solana-system-interface = {version = "2.0.0", features = ["bincode"]}
+
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+custom-heap = []
+custom-panic = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

@@ -1,0 +1,33 @@
+# Versions must already be installed. Adjust pins to your local installation.
+[[profiles]]
+name = "anza-v0"
+builder = "cargo-build-sbf"
+sbpf_version = "v0"
+platform_tools_version = "v1.54"
+release = true
+
+[[profiles]]
+name = "anza-v3"
+builder = "cargo-build-sbf"
+sbpf_version = "v3"
+platform_tools_version = "v1.54"
+release = true
+
+[[profiles]]
+name = "anza-v4"
+builder = "cargo-build-sbf"
+sbpf_version = "v4"
+platform_tools_version = "v1.54"
+release = true
+
+[[profiles]]
+name = "blueshift-v3"
+builder = "cargo-build-sbpf"
+# builder_path = "/absolute/path/to/cargo-build-sbpf"
+sbpf_version = "v3"
+rust_toolchain = "nightly"
+release = true
+# opt_level = "s"
+# cargo_args = ["--features=feature_name"]
+# [profiles.env]
+# CARGO_PROFILE_RELEASE_LTO = "thin"
