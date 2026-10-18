@@ -28,7 +28,7 @@ pub enum StackModel {
 impl StackModel {
     pub fn for_sbpf_version(version: u32) -> Self {
         match version {
-            0 | 3 => Self::FixedFrame,
+            0 | 3 | 4 => Self::FixedFrame,
             1 | 2 => Self::DynamicFrame,
             _ => Self::Unknown,
         }
@@ -241,6 +241,9 @@ pub enum AnalyzerError {
     #[error(transparent)]
     Disassembler(#[from] sbpf_disassembler::errors::DisassemblerError),
 
+    #[error("disassembly failed: {0:?}")]
+    Disassembly(Vec<sbpf_disassembler::errors::DisassemblerError>),
+
     #[error(transparent)]
     Sbpf(#[from] sbpf_common::errors::SBPFError),
 
@@ -265,7 +268,10 @@ fn extract_program_from_file(path: &str) -> Result<(Program, usize), AnalyzerErr
     let mut file = File::open(path)?;
     let mut b = vec![];
     file.read_to_end(&mut b)?;
-    Ok((Program::from_bytes(&b)?, b.len()))
+    Ok((
+        Program::from_bytes(&b).map_err(AnalyzerError::Disassembly)?,
+        b.len(),
+    ))
 }
 
 pub fn analyze_program(path: &str) -> Result<ProgramAnalysis, AnalyzerError> {
@@ -280,10 +286,9 @@ pub fn analyze_program(path: &str) -> Result<ProgramAnalysis, AnalyzerError> {
 
     let text_section_size = text_section.len();
 
-    let is_sbpf_v2 =
-        program.elf_header.e_flags == 0x02 && program.elf_header.e_machine == E_MACHINE_SBPF;
-
-    let ixs_meta = extract_instructions(text_section, is_sbpf_v2)?;
+    let decoder_version =
+        instruction_decoder_version(program.elf_header.e_machine, program.elf_header.e_flags);
+    let ixs_meta = extract_instructions(text_section, decoder_version)?;
     let func_entries = extract_function_entries(&ixs_meta)?;
     let bbs = extract_basic_blocks(&ixs_meta, &func_entries)?;
     let funcs = extract_functions(&bbs, &func_entries, &ixs_meta)?;
@@ -358,9 +363,19 @@ fn is_stack_access(ins: &Instruction) -> bool {
     is_mem && is_r10
 }
 
+fn instruction_decoder_version(machine: u16, flags: u32) -> u32 {
+    match (machine, flags) {
+        // v3 and v4 share instruction encoding, including JMP32.
+        // Preserve the actual ELF version separately in BinaryInfo.
+        (sbpf_disassembler::elf_header::E_MACHINE | E_MACHINE_SBPF, 3 | 4) => 3,
+        (E_MACHINE_SBPF, 2) => 2,
+        _ => 0,
+    }
+}
+
 fn extract_instructions(
     text_section: &[u8],
-    is_sbpf_v2: bool,
+    sbpf_version: u32,
 ) -> Result<Vec<InstructionMetadata>, AnalyzerError> {
     let mut pc = 0;
     let mut ixs: Vec<InstructionMetadata> = Vec::new();
@@ -378,10 +393,10 @@ fn extract_instructions(
 
         let window = &text_section[pc..pc + window_len];
 
-        let ix = if is_sbpf_v2 {
-            Instruction::from_bytes_sbpf_v2(window)?
-        } else {
-            Instruction::from_bytes(window)?
+        let ix = match sbpf_version {
+            2 => Instruction::from_bytes_sbpf_v2(window)?,
+            3 => Instruction::from_bytes_sbpf_v3(window)?,
+            _ => Instruction::from_bytes(window)?,
         };
 
         let ix_span_len = ix.span.len();
@@ -873,14 +888,51 @@ pub fn cumulative_stack_usage(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v3_and_v4_branch_opcode_is_not_decoded_as_v2_division() {
+        let branch = [0x56, 0x01, 75, 0, 3, 0, 0, 0];
+        for machine in [
+            sbpf_disassembler::elf_header::E_MACHINE,
+            super::E_MACHINE_SBPF,
+        ] {
+            for flags in [3, 4] {
+                let version = super::instruction_decoder_version(machine, flags);
+                assert_eq!(
+                    super::extract_instructions(&branch, version).unwrap()[0]
+                        .ix
+                        .opcode,
+                    super::Opcode::Jne32Imm
+                );
+            }
+        }
+        let decoded = super::extract_instructions(&branch, 3).unwrap();
+        assert_eq!(decoded[0].ix.opcode, super::Opcode::Jne32Imm);
+        assert!(decoded[0].ix.is_jump());
+        assert_eq!(decoded[0].ix.off.clone().unwrap().right(), Some(75));
+        let overlapping = [0x56, 0x01, 0, 0, 3, 0, 0, 0];
+        assert_eq!(
+            super::extract_instructions(&overlapping, 2).unwrap()[0]
+                .ix
+                .opcode,
+            super::Opcode::Udiv64Imm
+        );
+        assert_eq!(
+            super::extract_instructions(&overlapping, 3).unwrap()[0]
+                .ix
+                .opcode,
+            super::Opcode::Jne32Imm
+        );
+    }
+
     use super::*;
 
     #[test]
-    fn sbpf_v3_uses_fixed_stack_frames() {
+    fn sbpf_v3_and_v4_use_fixed_stack_frames() {
         assert_eq!(StackModel::for_sbpf_version(0), StackModel::FixedFrame);
         assert_eq!(StackModel::for_sbpf_version(1), StackModel::DynamicFrame);
         assert_eq!(StackModel::for_sbpf_version(2), StackModel::DynamicFrame);
         assert_eq!(StackModel::for_sbpf_version(3), StackModel::FixedFrame);
+        assert_eq!(StackModel::for_sbpf_version(4), StackModel::FixedFrame);
         assert_eq!(StackModel::for_sbpf_version(99), StackModel::Unknown);
     }
 

@@ -1,3 +1,6 @@
+mod backend;
+pub mod profiles;
+pub mod render;
 use crate::{ElfSizes, ProgramAnalysis, StackModel, analyze_program, cumulative_stack_usage};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,13 +45,16 @@ impl std::str::FromStr for SbpfVersion {
             .unwrap_or(trimmed)
             .parse::<u32>()
             .map_err(|_| CompilerDiffError::InvalidVersion(trimmed.to_string()))?;
+        if number > 4 {
+            return Err(CompilerDiffError::InvalidVersion(trimmed.to_string()));
+        }
         Ok(Self(number))
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct CompilerDiffOptions {
-    /// Empty means all architectures supported by the installed toolchain.
+    /// Empty selects supported v0–v3 architectures; v4 requires explicit selection.
     pub requested_versions: Vec<SbpfVersion>,
     pub release: bool,
     pub keep_builds: bool,
@@ -126,117 +132,117 @@ impl CompilerDiff {
         Ok(Self { options })
     }
 
+    fn legacy_report(named: profiles::ProfileReport) -> CompilerDiffReport {
+        let mut versions: Vec<_> = named
+            .profiles
+            .iter()
+            .filter_map(|r| r.analysis.clone())
+            .collect();
+        versions.sort_by_key(|a| a.version);
+        let baseline = versions
+            .first()
+            .map(|a| a.version)
+            .unwrap_or(SbpfVersion::new(0));
+        let deltas = versions
+            .first()
+            .map(|base| {
+                versions
+                    .iter()
+                    .skip(1)
+                    .map(|a| VersionDelta::from_summaries(base, a))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let builds = named
+            .profiles
+            .iter()
+            .map(|r| BuildResult {
+                version: SbpfVersion::new(r.profile.sbpf_version.number()),
+                state: match r.status {
+                    profiles::ProfileStatus::Analyzed | profiles::ProfileStatus::Built => {
+                        BuildState::Compiled
+                    }
+                    profiles::ProfileStatus::Unsupported => BuildState::Unsupported,
+                    _ => BuildState::Failed,
+                },
+                elf_path: r.elf_path.clone(),
+                detected_version: r.actual_architecture,
+                stdout: r
+                    .build
+                    .as_ref()
+                    .map(|b| b.stdout.clone())
+                    .unwrap_or_default(),
+                stderr: r
+                    .build
+                    .as_ref()
+                    .map(|b| b.stderr.clone())
+                    .unwrap_or_default(),
+                message: r.diagnostic.clone(),
+            })
+            .collect();
+        CompilerDiffReport {
+            build_root: named.build_root.clone(),
+            profile_report: Some(named),
+            baseline,
+            builds,
+            versions,
+            deltas,
+        }
+    }
+
     pub fn compile_and_compare(
         &self,
         program_dir: &Path,
     ) -> Result<CompilerDiffReport, CompilerDiffError> {
-        let builds = self.build_versions(program_dir)?;
-        let binaries = builds
-            .iter()
-            .filter_map(|build| {
-                build
-                    .elf_path
-                    .as_ref()
-                    .map(|path| (build.version, path.clone()))
-            })
-            .collect::<Vec<_>>();
-        let mut report = self.compare_binaries(binaries)?;
-        report.builds = builds;
-        Ok(report)
+        let named = self.profile_report(program_dir, self.options.keep_builds)?;
+        Ok(Self::legacy_report(named))
+    }
+
+    fn profile_report(
+        &self,
+        program_dir: &Path,
+        keep: bool,
+    ) -> Result<profiles::ProfileReport, CompilerDiffError> {
+        let supported = detect_supported_architectures()?;
+        let versions = versions_to_build(&self.options.requested_versions, &supported);
+        let config = profiles::ProfileConfig {
+            profiles: versions
+                .into_iter()
+                .map(|version| {
+                    let arch = match version.number() {
+                        0 => profiles::Architecture::V0,
+                        1 => profiles::Architecture::V1,
+                        2 => profiles::Architecture::V2,
+                        3 => profiles::Architecture::V3,
+                        4 => profiles::Architecture::V4,
+                        _ => return Err(CompilerDiffError::InvalidVersion(version.to_string())),
+                    };
+                    Ok(profiles::CompilerProfile {
+                        name: version.as_arch(),
+                        backend: profiles::BuilderSettings::Anza {
+                            platform_tools_version: None,
+                        },
+                        builder_path: None,
+                        sbpf_version: arch,
+                        release: true,
+                        opt_level: None,
+                        builder_args: vec![],
+                        cargo_args: vec![],
+                        env: BTreeMap::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>, CompilerDiffError>>()?,
+        };
+        profiles::compare_profiles(program_dir, config, None, keep)
+            .map_err(|e| CompilerDiffError::ToolchainProbe(format!("{e:#}")))
     }
 
     pub fn build_versions(
         &self,
         program_dir: &Path,
     ) -> Result<Vec<BuildResult>, CompilerDiffError> {
-        let supported = detect_supported_architectures()?;
-        let versions = versions_to_build(&self.options.requested_versions, &supported);
-        let build_root = compiler_diff_build_root();
-        fs::create_dir_all(&build_root)?;
-
-        let mut results = Vec::new();
-        for version in &versions {
-            if !supported.contains(version) {
-                results.push(BuildResult::unsupported(
-                    *version,
-                    "unsupported by installed cargo-build-sbf toolchain",
-                ));
-                continue;
-            }
-
-            let out_dir = build_root.join(version.as_arch());
-            fs::create_dir_all(&out_dir)?;
-            let output = Command::new("cargo")
-                .arg("build-sbf")
-                .arg("--arch")
-                .arg(version.as_arch())
-                .arg("--sbf-out-dir")
-                .arg(&out_dir)
-                .current_dir(program_dir)
-                .output()?;
-
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-            if !output.status.success() {
-                let unsupported = is_unsupported_target_error(&stderr);
-                results.push(BuildResult {
-                    version: *version,
-                    state: if unsupported {
-                        BuildState::Unsupported
-                    } else {
-                        BuildState::Failed
-                    },
-                    elf_path: None,
-                    detected_version: None,
-                    stdout,
-                    stderr,
-                    message: Some(if unsupported {
-                        "target architecture is not installed".to_string()
-                    } else {
-                        "cargo build-sbf failed".to_string()
-                    }),
-                });
-                continue;
-            }
-
-            let Some(elf_path) = find_built_elf(&out_dir)? else {
-                results.push(BuildResult {
-                    version: *version,
-                    state: BuildState::Failed,
-                    elf_path: None,
-                    detected_version: None,
-                    stdout,
-                    stderr,
-                    message: Some(format!("no .so produced under {}", out_dir.display())),
-                });
-                continue;
-            };
-
-            let preserved = preserve_elf(&elf_path, &out_dir, *version)?;
-            match analyze_program_path(&preserved) {
-                Ok(summary) => results.push(BuildResult {
-                    version: *version,
-                    state: BuildState::Compiled,
-                    elf_path: Some(preserved),
-                    detected_version: Some(summary.binary_info().sbpf_version()),
-                    stdout,
-                    stderr,
-                    message: None,
-                }),
-                Err(error) => results.push(BuildResult {
-                    version: *version,
-                    state: BuildState::Failed,
-                    elf_path: Some(preserved),
-                    detected_version: None,
-                    stdout,
-                    stderr,
-                    message: Some(format!("analysis failed after build: {error}")),
-                }),
-            }
-        }
-
-        Ok(results)
+        // This low-level API returns artifact paths; callers own cleanup, as before.
+        Ok(Self::legacy_report(self.profile_report(program_dir, true)?).builds)
     }
 
     pub fn compare_binaries(
@@ -299,6 +305,7 @@ pub fn compare_binaries(
         .collect();
 
     Ok(CompilerDiffReport {
+        profile_report: None,
         build_root,
         baseline,
         builds,
@@ -526,6 +533,9 @@ pub struct CompilerDiffReport {
     pub builds: Vec<BuildResult>,
     pub versions: Vec<BinaryAnalysisSummary>,
     pub deltas: Vec<VersionDelta>,
+    /// Full build provenance when produced by the compilation pipeline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_report: Option<profiles::ProfileReport>,
 }
 
 impl CompilerDiffReport {
@@ -546,6 +556,9 @@ impl CompilerDiffReport {
                 BuildState::Failed => "✗ failed",
             };
             writeln!(&mut out, "  {:<3} {marker}", build.version).unwrap();
+            if let Some(message) = &build.message {
+                writeln!(&mut out, "      {message}").unwrap();
+            }
         }
         writeln!(&mut out).unwrap();
         self.render_metric_table(&mut out);
@@ -585,6 +598,9 @@ impl CompilerDiffReport {
                 BuildState::Failed => "✗ failed",
             };
             writeln!(&mut out, "  {:<3} {marker}", build.version).unwrap();
+            if let Some(message) = &build.message {
+                writeln!(&mut out, "      {message}").unwrap();
+            }
             if let Some(message) = &build.message {
                 writeln!(&mut out, "      {message}").unwrap();
             }
@@ -1026,7 +1042,7 @@ fn detect_supported_architectures() -> Result<BTreeSet<SbpfVersion>, CompilerDif
     }
     let help = String::from_utf8_lossy(&output.stdout);
     let mut supported = BTreeSet::new();
-    for arch in ["v0", "v1", "v2", "v3"] {
+    for arch in ["v0", "v1", "v2", "v3", "v4"] {
         if help.contains(arch) {
             supported.insert(arch.parse()?);
         }
@@ -1044,7 +1060,11 @@ fn versions_to_build(
     supported: &BTreeSet<SbpfVersion>,
 ) -> Vec<SbpfVersion> {
     if requested.is_empty() {
-        supported.iter().copied().collect()
+        supported
+            .iter()
+            .copied()
+            .filter(|version| version.0 < 4)
+            .collect()
     } else {
         requested.to_vec()
     }
@@ -1064,30 +1084,6 @@ fn compiler_diff_build_root() -> PathBuf {
         "sbpf-eye-compiler-diff-{}-{stamp}",
         std::process::id()
     ))
-}
-
-fn find_built_elf(out_dir: &Path) -> Result<Option<PathBuf>, CompilerDiffError> {
-    let mut candidates = fs::read_dir(out_dir)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "so"))
-        .collect::<Vec<_>>();
-    candidates.sort();
-    Ok(candidates.into_iter().next())
-}
-
-fn preserve_elf(
-    elf_path: &Path,
-    out_dir: &Path,
-    version: SbpfVersion,
-) -> Result<PathBuf, CompilerDiffError> {
-    let stem = elf_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("program");
-    let preserved = out_dir.join(format!("{stem}-{}.so", version.as_arch()));
-    fs::copy(elf_path, &preserved)?;
-    Ok(preserved)
 }
 
 fn remove_transient_build_root(path: &Path) {
@@ -1220,8 +1216,8 @@ mod tests {
     }
 
     #[test]
-    fn omitted_versions_selects_every_supported_architecture() {
-        let supported = [0, 1, 2, 3]
+    fn automatic_versions_exclude_v4_but_explicit_selection_preserves_it() {
+        let supported = [0, 1, 2, 3, 4]
             .into_iter()
             .map(SbpfVersion::new)
             .collect::<BTreeSet<_>>();
@@ -1236,8 +1232,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            versions_to_build(&[SbpfVersion::new(3)], &supported),
-            vec![SbpfVersion::new(3)]
+            versions_to_build(&[SbpfVersion::new(4)], &supported),
+            vec![SbpfVersion::new(4)]
         );
     }
 
@@ -1302,6 +1298,7 @@ mod tests {
             assert_eq!(delta.max_local_stack_usage_delta, expected_delta);
 
             let report = CompilerDiffReport {
+                profile_report: None,
                 build_root: PathBuf::from("/tmp/builds"),
                 baseline: base.version,
                 builds: vec![],
@@ -1332,6 +1329,7 @@ mod tests {
         let base = summary(0, &[("add64", 10)], &[("same", 10, 8)]);
         let next = summary(1, &[("add64", 8), ("jmp32", 2)], &[("same", 11, 8)]);
         let report = CompilerDiffReport {
+            profile_report: None,
             build_root: PathBuf::from("/tmp/builds"),
             baseline: base.version,
             builds: vec![],
@@ -1368,6 +1366,7 @@ mod tests {
     #[test]
     fn report_renders_failed_and_unsupported_versions() {
         let report = CompilerDiffReport {
+            profile_report: None,
             build_root: PathBuf::from("/tmp/builds"),
             baseline: SbpfVersion::new(0),
             builds: vec![

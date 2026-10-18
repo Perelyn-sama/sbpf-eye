@@ -12,8 +12,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
+use sbpf_eye::compiler_diff::render::{self, OutputFormat, RenderOptions};
 use sbpf_eye::{BasicBlock, Function, InstructionMetadata, ProgramAnalysis, analyze_program};
-use std::{env, io, path::PathBuf};
+use std::{env, io, io::IsTerminal, path::PathBuf};
+
+mod progress;
 
 const DEFAULT_PROGRAM: &str = "samples/hello_solana_pinocchio_program.so";
 
@@ -38,15 +41,74 @@ fn main() -> Result<()> {
 }
 
 fn run_compiler_diff(args: Vec<String>) -> Result<()> {
+    if args.iter().any(|arg| arg == "--init-profiles") {
+        if args.len() != 1 {
+            bail!("--init-profiles cannot be combined with other arguments");
+        }
+        let path = saved_profiles_path()?;
+        let parent = path.parent().context("saved profiles path has no parent")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create config directory `{}`", parent.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| {
+                format!("cannot create `{}` (it may already exist)", path.display())
+            })?;
+        use std::io::Write;
+        file.write_all(include_str!("../examples/compiler-profiles.toml").as_bytes())?;
+        println!("Created compiler profiles at {}", path.display());
+        println!("Edit this file once, then use `--saved-profiles` or select profiles by name.");
+        return Ok(());
+    }
     let (program_dir, options, output) = parse_compiler_diff_args(args)?;
-    let keep_builds = options.keep_builds;
-    let report = sbpf_eye::compiler_diff::compile_and_compare(&program_dir, options)
-        .with_context(|| format!("failed to run compiler diff for {}", program_dir.display()))?;
-    let rendered = match output {
-        CompilerDiffOutput::Compact => report.render_compact(),
-        CompilerDiffOutput::Verbose => report.render_verbose(),
-        CompilerDiffOutput::Json => report.to_json()?,
+    let presentation = RenderOptions {
+        format: output,
+        program: Some(program_dir.display().to_string()),
+        width: if io::stdout().is_terminal() {
+            crossterm::terminal::size()
+                .map(|(w, _)| w as usize)
+                .unwrap_or(100)
+        } else {
+            100
+        },
+        color: render::colors_enabled(
+            io::stdout().is_terminal(),
+            env::var_os("NO_COLOR").is_some(),
+            env::var("TERM").ok().as_deref(),
+        ),
+        verbose: options.verbose,
+        show_config: options.show_config,
+        show_build_log: options.show_build_log,
+        show_target_spec: options.show_target_spec,
     };
+    if let Some(path) = &options.profiles_path {
+        use sbpf_eye::compiler_diff::profiles::{ProfileConfig, compare_profiles};
+        let contents = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "cannot read profiles file `{}`; for the saved user config, create it with `sbpf-eye compiler-diff --init-profiles`",
+                path.display()
+            )
+        })?;
+        let config = ProfileConfig::parse(&contents)?.select(&options.selected_profiles)?;
+        let progress = progress::Progress::start(output);
+        let report = compare_profiles(
+            &program_dir,
+            config,
+            options.baseline_profile.as_deref(),
+            options.keep_builds,
+        )?;
+        drop(progress);
+        println!("{}", render::render(&report, &presentation));
+        return Ok(());
+    }
+    let keep_builds = options.keep_builds;
+    let progress = progress::Progress::start(output);
+    let report = sbpf_eye::compiler_diff::compile_and_compare(&program_dir, options.build)
+        .with_context(|| format!("failed to run compiler diff for {}", program_dir.display()))?;
+    drop(progress);
+    let rendered = render::render_legacy(&report, keep_builds, &presentation);
     println!("{rendered}");
     if !keep_builds {
         report.cleanup_builds();
@@ -54,19 +116,60 @@ fn run_compiler_diff(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn parse_compiler_diff_args(
-    args: Vec<String>,
-) -> Result<(
-    PathBuf,
-    sbpf_eye::compiler_diff::CompilerDiffOptions,
-    CompilerDiffOutput,
-)> {
+#[derive(Default)]
+struct CompilerDiffCli {
+    build: sbpf_eye::compiler_diff::CompilerDiffOptions,
+    profiles_path: Option<PathBuf>,
+    selected_profiles: Vec<String>,
+    baseline_profile: Option<String>,
+    verbose: bool,
+    show_config: bool,
+    show_build_log: bool,
+    show_target_spec: bool,
+}
+impl std::ops::Deref for CompilerDiffCli {
+    type Target = sbpf_eye::compiler_diff::CompilerDiffOptions;
+    fn deref(&self) -> &Self::Target {
+        &self.build
+    }
+}
+impl std::ops::DerefMut for CompilerDiffCli {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.build
+    }
+}
+
+fn parse_compiler_diff_args(args: Vec<String>) -> Result<(PathBuf, CompilerDiffCli, OutputFormat)> {
     let mut program_dir = None;
-    let mut options = sbpf_eye::compiler_diff::CompilerDiffOptions::default();
-    let mut output = CompilerDiffOutput::Compact;
+    let mut options = CompilerDiffCli::default();
+    let mut output = OutputFormat::Terminal;
+    let mut use_saved_profiles = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--saved-profiles" => use_saved_profiles = true,
+            "--profiles" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .filter(|v| !v.is_empty() && !v.starts_with('-'))
+                    .context("--profiles requires a file path; use --saved-profiles for the saved user config")?;
+                options.profiles_path = Some(value.into());
+            }
+            "--select" | "--baseline" => {
+                let flag = args[i].as_str();
+                i += 1;
+                let value = args
+                    .get(i)
+                    .filter(|v| !v.is_empty() && !v.starts_with('-'))
+                    .with_context(|| format!("{flag} requires a value"))?;
+                match flag {
+                    "--select" => {
+                        options.selected_profiles = value.split(',').map(str::to_owned).collect()
+                    }
+                    _ => options.baseline_profile = Some(value.clone()),
+                }
+            }
             "--versions" => {
                 i += 1;
                 let Some(value) = args.get(i) else {
@@ -80,8 +183,20 @@ fn parse_compiler_diff_args(
             "--keep-builds" => {
                 options.keep_builds = true;
             }
-            "--verbose" => output = CompilerDiffOutput::Verbose,
-            "--json" => output = CompilerDiffOutput::Json,
+            "--verbose" => options.verbose = true,
+            "--show-config" => options.show_config = true,
+            "--show-build-log" => options.show_build_log = true,
+            "--show-target-spec" => options.show_target_spec = true,
+            "--format" => {
+                i += 1;
+                output = match args.get(i).map(String::as_str) {
+                    Some("terminal") => OutputFormat::Terminal,
+                    Some("json") => OutputFormat::Json,
+                    Some("markdown") => OutputFormat::Markdown,
+                    _ => bail!("--format requires terminal, json, or markdown"),
+                };
+            }
+            "--json" => output = OutputFormat::Json,
             "--help" | "-h" => {
                 print_compiler_diff_help();
                 std::process::exit(0);
@@ -100,14 +215,22 @@ fn parse_compiler_diff_args(
         bail!("missing PROGRAM_DIR\n\n{}", compiler_diff_usage());
     };
 
+    if use_saved_profiles && options.profiles_path.is_some() {
+        bail!("--saved-profiles cannot be combined with --profiles FILE");
+    }
+    let profile_mode = use_saved_profiles
+        || options.profiles_path.is_some()
+        || !options.selected_profiles.is_empty()
+        || options.baseline_profile.is_some();
+    if profile_mode && (!options.requested_versions.is_empty() || options.release) {
+        bail!(
+            "profile comparisons cannot be combined with --versions or --release; configure release in the profiles file"
+        );
+    }
+    if profile_mode && options.profiles_path.is_none() {
+        options.profiles_path = Some(saved_profiles_path()?);
+    }
     Ok((program_dir, options, output))
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CompilerDiffOutput {
-    Compact,
-    Verbose,
-    Json,
 }
 
 fn print_compiler_diff_help() {
@@ -115,7 +238,26 @@ fn print_compiler_diff_help() {
 }
 
 fn compiler_diff_usage() -> &'static str {
-    "Usage: sbpf-eye compiler-diff <PROGRAM_DIR> [--versions v0,v1,...] [--release] [--keep-builds] [--verbose | --json]\n\nBy default, all architectures supported by the installed cargo-build-sbf are compared.\nUse --versions to compare only the listed architectures.\nUse --verbose for opcode, function, and ELF details, or --json for complete machine-readable output."
+    "Usage: sbpf-eye compiler-diff <PROGRAM_DIR> [--versions v0,v1,... | --profiles FILE | --saved-profiles] [--select NAME,...] [--baseline NAME] [--release] [--keep-builds] [--format terminal|json|markdown] [--verbose] [--show-config] [--show-build-log] [--show-target-spec] [--json]\n       sbpf-eye compiler-diff --init-profiles\n\nBy default, supported v0–v3 architectures are compared; v4 requires explicit selection.\nUse --versions to compare only the listed architectures.\nUse --profiles FILE to load a profile file, or initialize a saved user config with --init-profiles and then use --saved-profiles. --select or --baseline without --profiles FILE also loads the saved config.\nUse --verbose for environment, opcode and function details. Use --show-config for configuration and build commands, --show-build-log for captured logs, and --show-target-spec for the compiler target specification. --json is an alias for --format json; JSON always includes all metadata."
+}
+
+fn saved_profiles_path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("SBPF_EYE_CONFIG_DIR") {
+        return Ok(PathBuf::from(path).join("compiler-profiles.toml"));
+    }
+    #[cfg(target_os = "windows")]
+    let config_root = env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let config_root = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Library/Application Support"));
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let config_root = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    let root =
+        config_root.context("cannot locate user config directory; set SBPF_EYE_CONFIG_DIR")?;
+    Ok(root.join("sbpf-eye").join("compiler-profiles.toml"))
 }
 
 fn run_tui(path: String, analysis: ProgramAnalysis) -> io::Result<()> {
@@ -529,4 +671,141 @@ fn instruction_detail(ix: &InstructionMetadata) -> String {
         ix.instruction().imm,
         ix.instruction()
     )
+}
+
+#[cfg(test)]
+mod compiler_profile_cli_tests {
+    use super::*;
+    fn parse(args: &[&str]) -> Result<(PathBuf, CompilerDiffCli, OutputFormat)> {
+        parse_compiler_diff_args(args.iter().map(|s| s.to_string()).collect())
+    }
+    #[test]
+    fn legacy_versions_and_flags_remain_available() {
+        let (_, options, output) = parse(&[
+            "program",
+            "--versions",
+            "v0,v2,v3",
+            "--keep-builds",
+            "--verbose",
+        ])
+        .unwrap();
+        assert_eq!(options.requested_versions.len(), 3);
+        assert!(options.keep_builds);
+        assert!(options.profiles_path.is_none());
+        assert!(matches!(output, OutputFormat::Terminal));
+        assert!(options.verbose);
+    }
+    #[test]
+    fn named_profiles_selection_and_baseline() {
+        let (_, o, out) = parse(&[
+            "program",
+            "--profiles",
+            "profiles.toml",
+            "--select",
+            "a,b",
+            "--baseline",
+            "b",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(o.selected_profiles, vec!["a", "b"]);
+        assert_eq!(o.baseline_profile.as_deref(), Some("b"));
+        assert!(matches!(out, OutputFormat::Json));
+    }
+    #[test]
+    fn formats_and_detail_flags_are_independent() {
+        for args in [
+            vec!["program", "--json", "--verbose"],
+            vec!["program", "--verbose", "--format", "json"],
+        ] {
+            let (_, o, f) = parse(&args).unwrap();
+            assert_eq!(f, OutputFormat::Json);
+            assert!(o.verbose);
+        }
+        let (_, o, f) = parse(&[
+            "program",
+            "--format",
+            "markdown",
+            "--show-config",
+            "--show-build-log",
+            "--show-target-spec",
+        ])
+        .unwrap();
+        assert_eq!(f, OutputFormat::Markdown);
+        assert!(o.show_config && o.show_build_log && o.show_target_spec);
+        assert!(parse(&["program", "--format"]).is_err());
+        assert!(parse(&["program", "--format", "csv"]).is_err());
+    }
+    #[test]
+    fn saved_profile_selection_is_order_independent() {
+        let expected = saved_profiles_path().unwrap();
+        for flags in [
+            vec!["--saved-profiles"],
+            vec!["--select", "anza-v3,blueshift-v3"],
+            vec!["--baseline", "anza-v3"],
+        ] {
+            for first in [true, false] {
+                let mut args = flags.clone();
+                if first {
+                    args.insert(0, "program");
+                } else {
+                    args.push("program");
+                }
+                let (program, options, _) = parse(&args).unwrap();
+                assert_eq!(program, PathBuf::from("program"));
+                assert_eq!(options.profiles_path.as_ref(), Some(&expected));
+            }
+        }
+        assert!(parse(&["program", "--profiles"]).is_err());
+        assert!(parse(&["program", "--profiles", "--saved-profiles"]).is_err());
+        let (_, options, _) = parse(&["--profiles", "custom.toml", "program"]).unwrap();
+        assert_eq!(options.profiles_path, Some(PathBuf::from("custom.toml")));
+    }
+
+    #[test]
+    fn all_profile_sources_reject_legacy_flags_in_either_order() {
+        for profiles in [
+            vec!["--saved-profiles"],
+            vec!["--profiles", "custom.toml"],
+            vec!["--select", "anza-v3"],
+            vec!["--baseline", "anza-v3"],
+        ] {
+            for legacy in [vec!["--versions", "v0"], vec!["--release"]] {
+                for reverse in [false, true] {
+                    let mut args = vec!["program"];
+                    let (first, second) = if reverse {
+                        (&legacy, &profiles)
+                    } else {
+                        (&profiles, &legacy)
+                    };
+                    args.extend(first);
+                    args.extend(second);
+                    let error = parse(&args).err().expect("must reject conflicting flags");
+                    assert!(error.to_string().contains("cannot be combined"));
+                }
+            }
+        }
+        for args in [
+            vec!["program", "--saved-profiles", "--profiles", "custom.toml"],
+            vec!["program", "--profiles", "custom.toml", "--saved-profiles"],
+        ] {
+            assert!(
+                parse(&args)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("cannot be combined")
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_cli_combinations_fail() {
+        for args in [
+            vec!["program", "--profiles", "p", "--versions", "v0"],
+            vec!["program", "--versions", "v99"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
+    }
 }
