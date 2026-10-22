@@ -27,6 +27,27 @@ fn main() -> Result<()> {
         return run_compiler_diff(args);
     }
 
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "-help"))
+        && args.first().is_none_or(|arg| arg != "--")
+    {
+        println!("{}", usage());
+        return Ok(());
+    }
+    if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
+        println!("sbpf-eye {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "--") {
+        args.remove(0);
+    } else if let Some(option) = args.iter().find(|arg| arg.starts_with('-')) {
+        bail!("unknown option `{option}`\nRun `sbpf-eye --help` for usage.");
+    }
+    if args.len() > 1 {
+        bail!("expected one program path\nRun `sbpf-eye --help` for usage.");
+    }
+
     let path = args
         .first()
         .cloned()
@@ -38,6 +59,21 @@ fn main() -> Result<()> {
     run_tui(path, analysis)?;
 
     Ok(())
+}
+
+fn usage() -> &'static str {
+    concat!(
+        "sbpf-eye ",
+        env!("CARGO_PKG_VERSION"),
+        " — Binary Inspection & Compiler Comparisons\n\n",
+        "Usage: sbpf-eye [PROGRAM.so]\n",
+        "       sbpf-eye compiler-diff <PROGRAM_DIR> [OPTIONS]\n\n",
+        "Inspect a compiled sBPF binary in the interactive viewer, or compare compiler output.\n",
+        "Without a path, opens samples/hello_solana_pinocchio_program.so from the current directory.\n\n",
+        "Options:\n  -h, --help       Show help\n  -V, --version    Show version\n",
+        "\n",
+        "Run `sbpf-eye compiler-diff --help` for comparison options."
+    )
 }
 
 fn run_compiler_diff(args: Vec<String>) -> Result<()> {
@@ -238,7 +274,58 @@ fn print_compiler_diff_help() {
 }
 
 fn compiler_diff_usage() -> &'static str {
-    "Usage: sbpf-eye compiler-diff <PROGRAM_DIR> [--versions v0,v1,... | --profiles FILE | --saved-profiles] [--select NAME,...] [--baseline NAME] [--release] [--keep-builds] [--format terminal|json|markdown] [--verbose] [--show-config] [--show-build-log] [--show-target-spec] [--json]\n       sbpf-eye compiler-diff --init-profiles\n\nBy default, supported v0–v3 architectures are compared; v4 requires explicit selection.\nUse --versions to compare only the listed architectures.\nUse --profiles FILE to load a profile file, or initialize a saved user config with --init-profiles and then use --saved-profiles. --select or --baseline without --profiles FILE also loads the saved config.\nUse --verbose for environment, opcode and function details. Use --show-config for configuration and build commands, --show-build-log for captured logs, and --show-target-spec for the compiler target specification. --json is an alias for --format json; JSON always includes all metadata."
+    r#"Compare the binaries produced by different sBPF architectures or compilers.
+
+Usage: sbpf-eye compiler-diff <PROGRAM_DIR> [OPTIONS]
+       sbpf-eye compiler-diff --init-profiles
+
+Arguments:
+  <PROGRAM_DIR>              Program directory containing Cargo.toml.
+                             Workspace members are supported.
+
+Compare architectures (default):
+  With no options, compare supported Anza v0–v3 architectures.
+  --versions LIST            Compare selected versions, e.g. v0,v2,v3.
+                             Experimental v4 must be selected explicitly.
+  --release                  Compatibility flag; Anza builds are already optimized.
+
+Compare compiler profiles:
+  --init-profiles            Create a saved starter config and print its path.
+                             Run alone, then edit it for your installed tools.
+  --saved-profiles           Compare all profiles in your saved config.
+  --profiles FILE            Load profiles from a TOML file instead.
+  --select NAME,...          Compare only these profiles.
+  --baseline NAME            Measure changes against this profile.
+                             Default: first selected profile in file order.
+
+  --select and --baseline use the saved config unless --profiles is given.
+  Profile mode cannot be combined with --versions or --release.
+
+Output:
+  --format FORMAT            terminal (default), json, or markdown.
+  --json                     Alias for --format json; includes all metadata.
+  --verbose                  Show environment, opcode, and function details.
+  --show-config              Show profile configuration and build commands.
+  --show-build-log           Show captured compiler stdout and stderr.
+  --show-target-spec         Show resolved compiler target specifications.
+  --keep-builds              Preserve temporary build files for inspection.
+  -h, --help                 Show this help.
+
+Examples:
+  # Compare architectures using Anza
+  sbpf-eye compiler-diff ./program
+  sbpf-eye compiler-diff ./program --versions v0,v3
+
+  # Set up saved profiles once, then compare compilers
+  sbpf-eye compiler-diff --init-profiles
+  sbpf-eye compiler-diff ./program --select anza-v3,blueshift-v3 --baseline anza-v3
+
+  # Export a report or investigate a failed build
+  sbpf-eye compiler-diff ./program --format markdown > comparison.md
+  sbpf-eye compiler-diff ./program --show-build-log
+
+Builds run offline. Install toolchains and fetch dependencies before comparing.
+Instruction counts are static measurements, not measured compute units."#
 }
 
 fn saved_profiles_path() -> Result<PathBuf> {
