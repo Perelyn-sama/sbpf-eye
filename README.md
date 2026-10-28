@@ -163,3 +163,16 @@ cargo test
 ```
 
 The included sample programs live in `samples/`.
+
+
+### Planned: Interactive compiler flags
+
+Add visual compiler flag controls to SBPF Eye’s web compiler comparison view.
+
+- Add, remove, and edit flags for each build profile.
+- Rebuild and compare assembly, instruction count, binary size, stack usage, and CFG changes.
+- Display the effective `rustc` flags and their sources, highlighting flags ignored by Cargo’s precedence rules.
+- Support distinct **unset**, **empty**, and **custom** states for `RUSTFLAGS`.
+- Show build diagnostics alongside configuration changes when removing a flag breaks compilation.
+
+A motivating example: setting `RUSTFLAGS=""` suppresses target-configured SBPF flags, including `--cfg target_os="solana"`. Without that cfg, `pinocchio-log` selects an implementation requiring `std` and fails on `bpfel-unknown-none`.
