@@ -619,7 +619,7 @@ fn build(
     let after = source_hashes(workspace)?;
     let build = r.build.as_ref().unwrap();
     if build.exit_code != Some(0) {
-        verify_source_unchanged(&before, &after, None)?;
+        verify_source_unchanged(&before, &after)?;
         if super::is_unsupported_target_error(&build.stderr) {
             r.status = ProfileStatus::Unsupported;
         }
@@ -627,38 +627,9 @@ fn build(
             "builder failed; see captured stdout/stderr. Setup prompts are never accepted; install prerequisites and prepare Cargo configuration manually"
         );
     }
-    let artifact_dir = match p.backend {
-        BuilderSettings::Anza { .. } => {
-            if p.release {
-                out
-            } else {
-                out.join("debug")
-            }
-        }
-        BuilderSettings::Blueshift { .. } => target.join("bpfel-unknown-none/release"),
-    };
-    let elf = find_elf(&artifact_dir)?;
+    verify_source_unchanged(&before, &after)?;
+    let elf = discover_elf(p, source, workspace, &out, &target)?;
     let elf_hash = format!("{:x}", Sha256::digest(fs::read(&elf)?));
-    // Some installed Blueshift builders/linkers also export a deployment copy
-    // beneath cwd, despite Cargo's explicit --target-dir. Accept only that exact
-    // new file, and only if it matches the fresh Cargo artifact byte-for-byte.
-    let deployment = if matches!(p.backend, BuilderSettings::Blueshift { .. }) {
-        let stem = elf
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .context("invalid ELF filename")?;
-        let name = stem.strip_prefix("lib").unwrap_or(stem);
-        Some((
-            source
-                .strip_prefix(workspace)?
-                .join("target/deploy")
-                .join(format!("{name}.so")),
-            elf_hash.clone(),
-        ))
-    } else {
-        None
-    };
-    verify_source_unchanged(&before, &after, deployment.as_ref())?;
     r.elf_sha256 = Some(elf_hash);
     r.elf_path = Some(elf);
     r.status = ProfileStatus::Built;
@@ -667,17 +638,11 @@ fn build(
 fn verify_source_unchanged(
     before: &BTreeMap<PathBuf, String>,
     after: &BTreeMap<PathBuf, String>,
-    deployment: Option<&(PathBuf, String)>,
 ) -> Result<()> {
     let changed: std::collections::BTreeSet<_> = before
         .keys()
         .chain(after.keys())
         .filter(|path| before.get(*path) != after.get(*path))
-        .filter(|path| {
-            !deployment.is_some_and(|(allowed, hash)| {
-                *path == allowed && !before.contains_key(*path) && after.get(*path) == Some(hash)
-            })
-        })
         .map(|p| p.display().to_string())
         .collect();
     if !changed.is_empty() {
@@ -687,6 +652,65 @@ fn verify_source_unchanged(
         );
     }
     Ok(())
+}
+
+// Prefer the builder's final deployment output. Do not recursively search Cargo's
+// build/deps directories: those can contain host libraries and intermediate ELFs.
+fn discover_elf(
+    p: &CompilerProfile,
+    source: &Path,
+    workspace: &Path,
+    out: &Path,
+    target: &Path,
+) -> Result<PathBuf> {
+    let mut directories = Vec::new();
+    if matches!(p.backend, BuilderSettings::Anza { .. }) {
+        directories.push(if p.release {
+            out.to_path_buf()
+        } else {
+            out.join("debug")
+        });
+    }
+    directories.extend([
+        source.join("target/deploy"),
+        workspace.join("target/deploy"),
+        target.join("deploy"),
+    ]);
+    if matches!(p.backend, BuilderSettings::Blueshift { .. }) {
+        directories.push(target.join("bpfel-unknown-none/release"));
+    }
+    let isolation_root = target
+        .parent()
+        .context("target directory has no parent")?
+        .canonicalize()?;
+    for directory in &directories {
+        if !directory.exists() {
+            continue;
+        }
+        if !directory.canonicalize()?.starts_with(&isolation_root) {
+            bail!(
+                "artifact directory escapes isolated build: {}",
+                directory.display()
+            );
+        }
+        // Empty output directories are normal; ambiguity in an existing layout
+        // is an error, never a reason to fall back to a different artifact.
+        if fs::read_dir(directory)?.any(|entry| {
+            entry.map_or(true, |e| {
+                e.path().extension().is_some_and(|ext| ext == "so")
+            })
+        }) {
+            return find_elf(directory);
+        }
+    }
+    bail!(
+        "no fresh deployable .so found in {}",
+        directories
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn find_elf(dir: &Path) -> Result<PathBuf> {
@@ -778,6 +802,12 @@ pub(super) fn source_hashes(root: &Path) -> Result<BTreeMap<PathBuf, String>> {
             let ty = entry.file_type()?;
             if ty.is_symlink() {
                 bail!("builder created source symlink {}", p.display());
+            }
+            // copy_source omits target directories at every workspace depth.
+            // Builders may recreate them even with an explicit --target-dir.
+            // Check symlinks above before excluding generated output trees.
+            if ty.is_dir() && entry.file_name() == "target" {
+                continue;
             }
             if ty.is_dir() {
                 walk(root, &p, m)?;
@@ -1031,35 +1061,152 @@ mod tests {
         .unwrap();
         assert_eq!(record.exit_code, Some(0));
     }
+    fn profiles() -> Vec<CompilerProfile> {
+        super::super::profiles::ProfileConfig::parse(
+            "[[profiles]]\nname='anza'\nbuilder='cargo-build-sbf'\nsbpf_version='v3'\n\n[[profiles]]\nname='blueshift'\nbuilder='cargo-build-sbpf'\nsbpf_version='v3'\n",
+        ).unwrap().profiles
+    }
+
     #[test]
-    fn deployment_copy_is_allowed_only_when_new_and_matching_fresh_elf() {
-        let before = BTreeMap::from([(PathBuf::from("Cargo.lock"), "lock".into())]);
-        let deployment: (PathBuf, String) = (
-            PathBuf::from("target/deploy/program.so"),
-            "fresh-elf".into(),
-        );
-        let mut after = before.clone();
-        after.insert(deployment.0.clone(), deployment.1.clone());
-        assert!(verify_source_unchanged(&before, &after, Some(&deployment)).is_ok());
-        assert!(verify_source_unchanged(&before, &after, None).is_err());
-        after.insert(deployment.0.clone(), "different-elf".into());
-        assert!(verify_source_unchanged(&before, &after, Some(&deployment)).is_err());
-        after.insert(deployment.0.clone(), deployment.1.clone());
-        for path in [
-            "Cargo.lock",
-            "Cargo.toml",
-            "src/lib.rs",
-            ".cargo/config.toml",
-            "target/unexpected.so",
-        ] {
-            let mut modified = after.clone();
-            modified.insert(path.into(), "changed".into());
-            let error = verify_source_unchanged(&before, &modified, Some(&deployment)).unwrap_err();
-            assert!(error.to_string().contains(path));
+    #[cfg(unix)]
+    fn successful_build_outputs_are_isolated_and_discovered_for_both_adapters() {
+        for mut p in profiles() {
+            for layout in [
+                "member",
+                "workspace",
+                "redirected",
+                "cargo",
+                "explicit",
+                "debug",
+            ] {
+                let blueshift = matches!(p.backend, BuilderSettings::Blueshift { .. });
+                if (layout == "cargo" && !blueshift)
+                    || (["explicit", "debug"].contains(&layout) && blueshift)
+                {
+                    continue;
+                }
+                p.release = layout != "debug";
+                let original = tempfile::tempdir().unwrap();
+                let isolated = tempfile::tempdir().unwrap();
+                fs::create_dir_all(original.path().join("member/src")).unwrap();
+                fs::write(original.path().join("Cargo.toml"), "workspace").unwrap();
+                fs::write(original.path().join("Cargo.lock"), "locked").unwrap();
+                fs::write(original.path().join("member/src/lib.rs"), "source").unwrap();
+                let original_before = source_hashes(original.path()).unwrap();
+                let workspace = isolated.path().join("source");
+                copy_source(original.path(), &workspace).unwrap();
+                let source = workspace.join("member");
+                let target = isolated.path().join("target");
+                let out = isolated.path().join("elf");
+                let destination = match layout {
+                    "member" => source.join("target/deploy"),
+                    "workspace" => workspace.join("target/deploy"),
+                    "redirected" => target.join("deploy"),
+                    "cargo" => target.join("bpfel-unknown-none/release"),
+                    "explicit" => out.clone(),
+                    "debug" => out.join("debug"),
+                    _ => unreachable!(),
+                };
+                let before = source_hashes(&workspace).unwrap();
+                // A successful builder can emit several generated files and a
+                // deploy ELF different from its unprocessed Cargo output.
+                let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("samples/hello_solana_pinocchio_program.so");
+                let record = run(Path::new("/bin/sh"), &[
+                    "-c".into(),
+                    "mkdir -p \"$1\" target/cache; cp \"$2\" \"$1/program.so\"; echo generated > target/cache/build.log".into(),
+                    "builder".into(), destination.display().to_string(), fixture.display().to_string(),
+                ], &source, &BTreeMap::new()).unwrap();
+                assert_eq!(record.exit_code, Some(0));
+                verify_source_unchanged(&before, &source_hashes(&workspace).unwrap()).unwrap();
+                let elf = discover_elf(&p, &source, &workspace, &out, &target).unwrap();
+                assert_eq!(elf, destination.join("program.so"));
+                assert!(crate::analyze_program(elf.to_str().unwrap()).is_ok());
+                assert_eq!(original_before, source_hashes(original.path()).unwrap());
+                assert!(!original.path().join("member/target").exists());
+                assert!(!original.path().join("target").exists());
+                if blueshift && layout != "cargo" {
+                    fs::create_dir_all(target.join("bpfel-unknown-none/release")).unwrap();
+                    fs::write(
+                        target.join("bpfel-unknown-none/release/libprogram.so"),
+                        "intermediate",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        discover_elf(&p, &source, &workspace, &out, &target).unwrap(),
+                        elf
+                    );
+                }
+                fs::write(destination.join("another.so"), "ambiguous").unwrap();
+                assert!(discover_elf(&p, &source, &workspace, &out, &target).is_err());
+            }
         }
-        let mut stale = before.clone();
-        stale.insert(deployment.0.clone(), "old-elf".into());
-        assert!(verify_source_unchanged(&stale, &after, Some(&deployment)).is_err());
+    }
+
+    #[test]
+    fn generated_targets_do_not_hide_source_additions_edits_or_deletions() {
+        for path in [
+            "Cargo.toml",
+            "Cargo.lock",
+            "build.rs",
+            "src/lib.rs",
+            ".cargo/config",
+            ".cargo/config.toml",
+            "rust-toolchain.toml",
+            "member/Cargo.toml",
+            "member/src/target_helpers/lib.rs",
+        ] {
+            for operation in ["add", "edit", "delete"] {
+                let dir = tempfile::tempdir().unwrap();
+                let file = dir.path().join(path);
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                if operation != "add" {
+                    fs::write(&file, "before").unwrap();
+                }
+                let before = source_hashes(dir.path()).unwrap();
+                fs::create_dir_all(dir.path().join("target/deploy")).unwrap();
+                fs::write(dir.path().join("target/deploy/program.so"), "generated").unwrap();
+                if operation == "delete" {
+                    fs::remove_file(&file).unwrap();
+                } else {
+                    fs::write(&file, "after").unwrap();
+                }
+                let error = verify_source_unchanged(&before, &source_hashes(dir.path()).unwrap())
+                    .unwrap_err();
+                assert!(error.to_string().contains(path));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn generated_target_symlink_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(external.path(), dir.path().join("target")).unwrap();
+        assert!(source_hashes(dir.path()).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deploy_directory_cannot_escape_isolated_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        fs::write(external.path().join("program.so"), "external").unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir_all(source.join("target")).unwrap();
+        std::os::unix::fs::symlink(external.path(), source.join("target/deploy")).unwrap();
+        for p in profiles() {
+            let error = discover_elf(
+                &p,
+                &source,
+                &source,
+                &dir.path().join("elf"),
+                &dir.path().join("target"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("escapes isolated build"));
+        }
     }
 
     #[test]
