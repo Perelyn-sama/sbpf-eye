@@ -13,18 +13,28 @@ Calls encoded as unresolved relocation placeholders, such as `src = 1,
 imm = -1`, are not treated as direct local call edges unless the analyzer has
 resolved them. This avoids false self-call edges.
 
-## Usage
+## Installation
 
-Run against the default sample:
+Install from this repository:
 
 ```sh
-cargo run
+cargo install --path .
+```
+
+Ensure Cargo’s binary directory (`~/.cargo/bin` by default) is on your `PATH`.
+
+## Usage
+
+Run against the default sample from the repository root:
+
+```sh
+sbpf-eye
 ```
 
 Run against a specific SBPF shared object:
 
 ```sh
-cargo run -- samples/hello_solana_pinocchio_program.so
+sbpf-eye samples/hello_solana_pinocchio_program.so
 ```
 
 ## Compiler Diff
@@ -50,8 +60,8 @@ Use Anza to compare supported v0–v3 architectures, or select versions explicit
 (v4 is opt-in):
 
 ```sh
-cargo run -- compiler-diff <PROGRAM_DIR>
-cargo run -- compiler-diff <PROGRAM_DIR> --versions v0,v2,v3
+sbpf-eye compiler-diff <PROGRAM_DIR>
+sbpf-eye compiler-diff <PROGRAM_DIR> --versions v0,v2,v3
 ```
 
 ### Compare compiler profiles
@@ -59,7 +69,7 @@ cargo run -- compiler-diff <PROGRAM_DIR> --versions v0,v2,v3
 Create a reusable config, then edit the printed file to match your installed tools:
 
 ```sh
-cargo run -- compiler-diff --init-profiles
+sbpf-eye compiler-diff --init-profiles
 ```
 
 The starter config includes `anza-v0`, `anza-v3`, `anza-v4`, and `blueshift-v3`.
@@ -72,18 +82,18 @@ Override its directory with `SBPF_EYE_CONFIG_DIR`.
 
 ```sh
 # Compare two saved profiles
-cargo run -- compiler-diff <PROGRAM_DIR> \
+sbpf-eye compiler-diff <PROGRAM_DIR> \
   --select anza-v3,blueshift-v3 --baseline anza-v3
 
 # Compare Anza v3 and v4 (add anza-v4 from the example if using an older config)
-cargo run -- compiler-diff <PROGRAM_DIR> \
+sbpf-eye compiler-diff <PROGRAM_DIR> \
   --select anza-v3,anza-v4 --baseline anza-v3
 
 # Compare every saved profile
-cargo run -- compiler-diff <PROGRAM_DIR> --saved-profiles
+sbpf-eye compiler-diff <PROGRAM_DIR> --saved-profiles
 
 # Use a specific config file
-cargo run -- compiler-diff <PROGRAM_DIR> \
+sbpf-eye compiler-diff <PROGRAM_DIR> \
   --profiles examples/compiler-profiles.toml --baseline anza-v3
 ```
 
